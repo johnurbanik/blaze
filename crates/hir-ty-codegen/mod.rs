@@ -5710,7 +5710,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let allocation = db.const_eval_static(id).map_err(|e| {
             refused_const_eval(db, GeneralConstId::StaticId(id), &e)
                 // alloc: the error's message
-                .unwrap_or_else(|| CodegenError::Frontend(format!("const eval: {e:?}")))
+                .unwrap_or_else(|| {
+                    let name = StaticSignature::of(db, id).name.as_str().to_owned();
+                    CodegenError::Frontend(format!("const eval of static `{name}`: {e:?}"))
+                })
         })?;
         // Nothing can be written to a static of no size.
         let writable = !allocation.memory.is_empty()

@@ -5405,8 +5405,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             self.record_static(result.addr, size, st)?;
             return Ok(location);
         } else {
-            let ty = InferenceResult::of(self.db, DefWithBodyId::from(st))
-                .expr_ty(Body::of(self.db, st.into()).root_expr());
+            // Its declared type: it has no body to read one from.
+            let ty = self.db.type_for_static(st).instantiate_identity().skip_norm_wip();
             let Some((size, align)) = self.size_align_of(ty, locals)? else {
                 not_supported!("unsized extern static");
             };

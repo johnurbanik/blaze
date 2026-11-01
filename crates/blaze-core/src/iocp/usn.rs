@@ -60,6 +60,10 @@ use crate::{Cursor, FileName, Journaled, Lost};
 
 /// What one read of the journal fills at most.
 const BUFFER: usize = 256 << 10;
+/// `ERROR_INVALID_USER_BUFFER`, which windows-sys's feature set here does not name.
+const ERROR_INVALID_USER_BUFFER: u32 = 1784;
+/// How many refused reads in a row, 20 ms apart, the watch outlasts.
+const BUSY_RETRIES: u32 = 500;
 /// Names a batch of the history gathers before it is told.
 const GATHER: usize = 4096;
 /// How far the journal may move past the last batch told before a live read of nothing under
@@ -709,6 +713,8 @@ pub(super) struct Journal {
     /// The request the kernel reads while a read is in flight (`METHOD_NEITHER`: in place), in
     /// the boxed journal, which stays where it is while the request holds it.
     input: READ_USN_JOURNAL_DATA_V1,
+    /// Reads in a row refused as `ERROR_INVALID_USER_BUFFER`.
+    busy: u32,
     /// Where the kernel writes records: `u64`s, as they are 8-aligned. The watch's own, made
     /// once as it starts (256 KiB, four of the driver's buffers, which a watch that lives as
     /// long as the daemon would only hold the same way).
@@ -803,6 +809,7 @@ impl Journal {
             // alloc: setup, the one buffer every read of the watch fills.
             buffer: vec![0u64; BUFFER / 8].into_boxed_slice(),
             records: Vec::with_capacity(BUFFER / 64),
+            busy: 0,
         });
         let first = journal.caught_up.then(|| journal.batch());
         Ok((journal, first))
@@ -858,7 +865,10 @@ impl Journal {
     pub(super) fn take(&mut self, result: io::Result<u32>) -> Taken {
         let start = self.next;
         let got = match result {
-            Ok(got) => got as usize,
+            Ok(got) => {
+                self.busy = 0;
+                got as usize
+            }
             Err(error) => return self.failed(error),
         };
         // SAFETY: the read's completion was taken, so the kernel holds the buffer no more; it
@@ -957,6 +967,13 @@ impl Journal {
             }
             Some(ERROR_INVALID_FUNCTION) => {
                 self.end(format_args!("reading it unprivileged needs Windows 10 1709 or later"))
+            }
+            // Too many asynchronous requests outstanding on the machine: nothing is wrong with
+            // this read, and the same read goes through once they drain.
+            Some(ERROR_INVALID_USER_BUFFER) if self.busy < BUSY_RETRIES => {
+                self.busy += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                Taken { batch: None, end: None }
             }
             _ => self.end(format_args!("reading it: {error}")),
         }

@@ -128,6 +128,11 @@ fn stand_ins(dir: &std::path::Path, launcher: &std::path::Path) -> Result<(), St
     std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
     for name in ["rustc", "rustdoc"] {
         let at = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        // A hard link has no target to compare, and a rebuilt launcher leaves the old file behind.
+        #[cfg(windows)]
+        if at.exists() {
+            std::fs::remove_file(&at).map_err(|error| format!("{}: {error}", at.display()))?;
+        }
         match std::fs::read_link(&at) {
             Ok(to) if to == launcher => continue,
             Ok(_) => std::fs::remove_file(&at).map_err(|error| format!("{}: {error}", at.display()))?,

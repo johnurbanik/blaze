@@ -168,9 +168,12 @@ fn configure(bytes: &[u8]) -> Configured {
     }
     let lookup = |name: &str| env.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str());
     let home = match lookup("CARGO_HOME") {
-        Some(home) if home.starts_with('/') => Some(home.to_owned()),
+        Some(home) if home.starts_with('/') || std::path::Path::new(home).is_absolute() => Some(home.to_owned()),
         Some(home) => Some(format!("{}/{home}", invocation.cwd)),
-        None => lookup("HOME").filter(|it| !it.is_empty()).map(|home| format!("{home}/.cargo")),
+        None => lookup("HOME")
+            .or_else(|| lookup("USERPROFILE").filter(|_| cfg!(windows)))
+            .filter(|it| !it.is_empty())
+            .map(|home| format!("{home}/.cargo")),
     };
     if let Some(home) = home.as_deref().and_then(|it| super::files::normal(std::path::Path::new(it))) {
         if !known.contains(&home) {

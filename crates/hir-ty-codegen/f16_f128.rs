@@ -37,6 +37,9 @@ pub(super) fn soft_floats(target: &Target) -> bool {
     match (target.arch, target.call_conv) {
         (Arch::Aarch64, isa::CallConv::SystemV | isa::CallConv::AppleAarch64) => true,
         (Arch::X86_64, isa::CallConv::SystemV) => true,
+        // Cranelift's Windows convention passes an `f128` by reference and returns it in
+        // `xmm0`, as LLVM's does. Not yet compared with rustc.
+        (Arch::X86_64, isa::CallConv::WindowsFastcall) => true,
         _ => false,
     }
 }

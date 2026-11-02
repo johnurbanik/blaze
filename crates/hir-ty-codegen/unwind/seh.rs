@@ -90,6 +90,10 @@ pub(in super::super) const ARRIVAL: i32 = 16;
 /// the size of the object.
 pub(in super::super) const OBJECT: i64 = 24;
 
+/// Where the size of the thrown object is in the `ThrowInfo` of a Rust panic: `_CatchableType`'s,
+/// in the one block `seh_throw_info` writes.
+const OWN_SIZE: i32 = 44;
+
 /// The exception code of the C++ runtime of MSVC, and the first of its four parameters.
 /// The other three are the object, its `ThrowInfo`, and the image the latter is in.
 const CXX_EXCEPTION: u32 = 0xE06D_7363;
@@ -523,15 +527,26 @@ fn personality(shim: &mut Shim<'_>) {
 
     // The size is with the first of the types the object can be caught as.
     shim.builder.switch_to_block(sized);
-    // Our `ThrowInfo` is on the heap, in no image, so the thrower found none: the image is
-    // after it (`seh_throw_info`).
-    let beside = shim.load(I64, throw_info, 56);
-    let thrown_from = shim.builder.ins().select(thrown_from, thrown_from, beside);
+    // Our `ThrowInfo` is on the heap, in no image, so the thrower found none and its offsets
+    // are from nowhere: the size is at its place in the table (`seh_throw_info`).
+    let [foreign, own, sizing] = std::array::from_fn(|_| shim.builder.create_block());
+    shim.builder.append_block_param(sizing, I64);
+    shim.builder.ins().brif(thrown_from, foreign, &[], own, &[]);
+
+    shim.builder.switch_to_block(own);
+    let size = shim.load_u32(throw_info, OWN_SIZE);
+    shim.builder.ins().jump(sizing, &[size.into()]);
+
+    shim.builder.switch_to_block(foreign);
     let types = shim.load_u32(throw_info, 12);
     let types = shim.builder.ins().iadd(thrown_from, types);
     let first = shim.load_u32(types, 4);
     let first = shim.builder.ins().iadd(thrown_from, first);
     let size = shim.load_u32(first, 20);
+    shim.builder.ins().jump(sizing, &[size.into()]);
+
+    shim.builder.switch_to_block(sizing);
+    let size = shim.builder.block_params(sizing)[0];
     let heap = shim.heap();
     let no_flags = shim.builder.ins().iconst(I32, 0);
     let whole = shim.builder.ins().iadd_imm_s(size, OBJECT);

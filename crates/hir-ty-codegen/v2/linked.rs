@@ -82,6 +82,9 @@ fn linked(db: &Db, krate: Crate) -> Result<Vec<NativeLib>, String> {
                     Written::Unspecified | Written::Dylib => NativeLibKind::Dylib,
                     Written::Static => NativeLibKind::Static { whole: lib.whole_archive, bundle: lib.bundle },
                     Written::Framework => NativeLibKind::Framework,
+                    // std's `ProcessPrng`: the link of a Windows program adds an import library
+                    // of it, which the SDK has not.
+                    Written::RawDylib if name == "bcryptprimitives" => continue,
                     Written::RawDylib => {
                         // alloc: an error
                         return Err(format!(

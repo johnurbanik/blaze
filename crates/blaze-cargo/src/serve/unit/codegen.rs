@@ -841,8 +841,20 @@ fn link_at(
     output.sanitize = generated.policy.sanitize;
     let (libs, search) = natives(job, unit, &generated.frontend)?;
     let sysroot = crate::toolchain::sysroot().ok_or(LinkCause::NoToolchain)?;
-    let located =
+    let mut located =
         blaze_link::target::locate(&mut output, &libs, &search, &sysroot).map_err(linker(LinkStep::Locate))?;
+    if triple(job, u).ends_with("windows-msvc") {
+        located.push(blaze_link::target::Located {
+            path: seh_runtime()?,
+            name: "blaze-seh-runtime".to_owned(),
+            kind: blaze_link::NativeKind::Object,
+        });
+        located.push(blaze_link::target::Located {
+            path: bcryptprimitives()?,
+            name: "bcryptprimitives.lib".to_owned(),
+            kind: blaze_link::NativeKind::Archive { whole: false },
+        });
+    }
     let side = generated.side()?;
 
     let (mut linked, changed) = kept_image(images, path, &output)?;
@@ -852,6 +864,35 @@ fn link_at(
     images.push(KeptImage { path: path.to_owned(), kept: linked });
     let (bytes, read, table, full) = made?;
     Ok(LinkMade { bytes, read, table, how: linking(changed, full, output.incremental) })
+}
+
+/// The object of Windows's landing pads ([`hir_ty_codegen::seh_runtime_object`]) as a file,
+/// written once per daemon: natives are files.
+fn seh_runtime() -> Result<std::path::PathBuf, LinkCause> {
+    static OBJECT: std::sync::OnceLock<Result<std::path::PathBuf, String>> = std::sync::OnceLock::new();
+    let path = std::path::Path::new("blaze-seh-runtime.obj");
+    let made = OBJECT.get_or_init(|| {
+        let at = blaze_api::client::home()?.join(path);
+        std::fs::write(&at, hir_ty_codegen::seh_runtime_object()?).map_err(|error| error.to_string())?;
+        Ok(at)
+    });
+    made.clone().map_err(|error| {
+        LinkCause::Native(blaze_usercode::inputs::Unreadable { path: path.to_owned(), error })
+    })
+}
+
+/// The import library of `bcryptprimitives.dll` (`lib /def`, of `ProcessPrng` alone), which
+/// std links as `raw-dylib`, as a file.
+fn bcryptprimitives() -> Result<std::path::PathBuf, LinkCause> {
+    let path = std::path::Path::new("blaze-bcryptprimitives.lib");
+    let bytes = include_bytes!("bcryptprimitives.lib");
+    let unreadable = |error: String| blaze_usercode::inputs::Unreadable { path: path.to_owned(), error };
+    let at = blaze_api::client::home().map_err(|error| LinkCause::Native(unreadable(error)))?.join(path);
+    if std::fs::metadata(&at).is_ok_and(|it| it.len() == bytes.len() as u64) {
+        return Ok(at);
+    }
+    std::fs::write(&at, bytes).map_err(|error| LinkCause::Native(unreadable(error.to_string())))?;
+    Ok(at)
 }
 
 /// The image to link `output` into at `path`, taken out of `images`, and the fields of

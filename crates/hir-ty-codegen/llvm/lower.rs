@@ -567,7 +567,12 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         // Without, LLVM gives the frame pointer's register to values, and code that walks the
         // frames by it reads one of those.
         let frame = crate::backend::frame_pointers().then_some(("frame-pointer", "all"));
-        for (name, value) in [("target-cpu", target.cpu())].into_iter().chain(probe).chain(frame) {
+        // COFF's jump tables are offsets from the code in `.rdata`, which `blob` does not read.
+        let windows = target.call_conv == cranelift_codegen::isa::CallConv::WindowsFastcall;
+        let tables = windows.then_some(("no-jump-tables", "true"));
+        for (name, value) in
+            [("target-cpu", target.cpu())].into_iter().chain(probe).chain(frame).chain(tables)
+        {
             let attribute = context.create_string_attribute(name, value);
             function.add_attribute(AttributeLoc::Function, attribute);
         }

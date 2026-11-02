@@ -2261,13 +2261,13 @@ impl<'a> Stage<'a> {
                     }
                     continue;
                 }
-                SymbolDef::Fallback { search, .. } => {
+                SymbolDef::Fallback { symbol: default, search } => {
                     if search {
                         b.flag(slot, PULL);
                     }
                     let it = &mut b.graph.slots[slot as usize];
                     if it.fallback == NONE64 {
-                        it.fallback = pack(load, at as u32);
+                        it.fallback = pack(load, default);
                     }
                     continue;
                 }

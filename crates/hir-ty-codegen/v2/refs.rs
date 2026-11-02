@@ -596,11 +596,11 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         for libcall in [ir::LibCall::Memcpy, ir::LibCall::Memmove, ir::LibCall::Memset] {
             self.libcall(libcall)?;
         }
-        self.symbol(places::PERSONALITY)?;
-        let resume = match self.fx.cg.target.exception_in_register() {
-            true => "_Unwind_Resume",
-            false => crate::unwind::seh::RESUME,
+        let (personality, resume) = match self.fx.cg.target.exception_in_register() {
+            true => (places::PERSONALITY, "_Unwind_Resume"),
+            false => (crate::unwind::seh::PERSONALITY, crate::unwind::seh::RESUME),
         };
+        self.symbol(personality)?;
         self.symbol(resume)
     }
 
@@ -1553,7 +1553,10 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             });
         }
         if seh {
-            // `seh_throw_info`: the image's base, which the offsets it writes are from.
+            // `seh_throw_info`: a block of the heap, and the image's base, which the offsets
+            // it writes are from.
+            self.symbol("GetProcessHeap")?;
+            self.symbol("HeapAlloc")?;
             return self.symbol("GetModuleHandleW");
         }
         // A `#[naked]` function is its assembly, which names its `sym`s.

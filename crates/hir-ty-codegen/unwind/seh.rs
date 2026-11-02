@@ -117,7 +117,7 @@ pub(super) struct Frame {
 pub(in super::super) struct Pads(Vec<u8>);
 
 impl Pads {
-    const ENTRY: usize = 12;
+    pub(in super::super) const ENTRY: usize = 12;
 
     /// A call that returns to `returns_to` and looks at [`ARRIVAL`] when it has.
     pub(super) fn returning(&mut self, returns_to: u32) {
@@ -258,10 +258,103 @@ fn with_saves(info: Vec<u8>) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Compiled code of the runtime, with the `UNWIND_INFO` the unwinder needs to pass its frames.
 struct Entry {
     func: FuncId,
     frame: Frame,
-    pads: Option<Vec<u8>>,
+}
+
+/// The object a Windows program with landing pads links: the personality, [`RESUME`] and
+/// [`RELEASE`], with their `.pdata` and `.xdata`.
+pub(in super::super) fn runtime_object(isa: cranelift_codegen::isa::OwnedTargetIsa) -> Result<Vec<u8>, String> {
+    let names = cranelift_module::default_libcall_names();
+    let builder = cranelift_object::ObjectBuilder::new(isa, "blaze_seh", names).map_err(|e| e.to_string())?;
+    let mut module = ObjectModule::new(builder);
+    let mut entries = Vec::with_capacity(3);
+    define(&mut module, &mut entries, PERSONALITY, &[I64; 4], &[I32], personality)?;
+    define(&mut module, &mut entries, RESUME, &[I64], &[], resume)?;
+    define(&mut module, &mut entries, RELEASE, &[I64], &[], release)?;
+    let mut product = module.finish();
+    emit(&mut product, entries)?;
+    product.emit().map_err(|e| e.to_string())
+}
+
+fn define(
+    module: &mut ObjectModule,
+    entries: &mut Vec<Entry>,
+    name: &str,
+    params: &[ir::Type],
+    returns: &[ir::Type],
+    build: fn(&mut Shim<'_>),
+) -> Result<(), String> {
+    let sig = signature(module, params, returns);
+    // alloc: the error's message
+    let id = module.declare_function(name, Linkage::Export, &sig).map_err(|e| e.to_string())?;
+    let mut ctx = Context::new();
+    ctx.func.signature = sig;
+    let mut builder_ctx = FunctionBuilderContext::new();
+    let mut error = None;
+    {
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        let mut shim = Shim { builder, module, entry, error: &mut error };
+        build(&mut shim);
+        shim.builder.seal_all_blocks();
+        let config = shim.module.target_config();
+        shim.builder.finalize(config);
+    }
+    if let Some(error) = error {
+        return Err(error);
+    }
+    // alloc: the error's message
+    module.define_function(id, &mut ctx).map_err(|e| e.to_string())?;
+    // The unwinder passes these frames too: each calls what unwinds or throws.
+    if let Some(FunctionUnwind { frame: super::Frame::Windows(frame), .. }) = FunctionUnwind::of(module.isa(), &ctx)? {
+        entries.push(Entry { func: id, frame });
+    }
+    Ok(())
+}
+
+/// Writes an `UNWIND_INFO` for each function to `.xdata`, and to `.pdata` where each function
+/// is and where its `UNWIND_INFO` is, in the order of the addresses.
+fn emit(product: &mut ObjectProduct, mut entries: Vec<Entry>) -> Result<(), String> {
+    entries.sort_by_key(|entry| product.object.symbol(product.function_symbol(entry.func)).value);
+    let mut xdata = Vec::new();
+    let mut pdata = Vec::with_capacity(12 * entries.len());
+    let mut functions = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        functions.push((product.function_symbol(entry.func), entry.frame.len, xdata.len()));
+        xdata.extend_from_slice(&entry.frame.info);
+        pdata.extend_from_slice(&[0; 12]);
+    }
+    let object = &mut product.object;
+    let xdata_section = object.add_section(Vec::new(), b".xdata".to_vec(), SectionKind::ReadOnlyData);
+    object.section_mut(xdata_section).set_data(xdata, 4);
+    let pdata_section = object.add_section(Vec::new(), b".pdata".to_vec(), SectionKind::ReadOnlyData);
+    object.section_mut(pdata_section).set_data(pdata, 4);
+    let xdata_symbol = object.section_symbol(xdata_section);
+    let mut relocate = |section: SectionId, offset: usize, symbol: SymbolId, addend: i64| {
+        // What is local is addressed through its section.
+        let (symbol, within) = object.symbol_section_and_offset(symbol).unwrap_or((symbol, 0));
+        let flags = RelocationFlags::Generic {
+            kind: RelocationKind::ImageOffset,
+            encoding: RelocationEncoding::Generic,
+            size: 32,
+        };
+        object
+            .add_relocation(section, Relocation { offset: offset as u64, symbol, flags, addend: within as i64 + addend })
+            // alloc: the error's message
+            .map_err(|e| e.to_string())
+    };
+    for (index, (symbol, len, info)) in functions.into_iter().enumerate() {
+        let at = index * 12;
+        relocate(pdata_section, at, symbol, 0)?;
+        relocate(pdata_section, at + 4, symbol, i64::from(len))?;
+        relocate(pdata_section, at + 8, xdata_symbol, info as i64)?;
+    }
+    Ok(())
 }
 
 fn signature(module: &ObjectModule, params: &[ir::Type], returns: &[ir::Type]) -> Signature {
@@ -367,8 +460,8 @@ impl Shim<'_> {
 
 /// `EXCEPTION_DISPOSITION personality(EXCEPTION_RECORD *, void *frame, CONTEXT *,
 /// DISPATCHER_CONTEXT *)`: what the unwinder calls for a frame of a function with landing
-/// pads. The data that follows the handler in the function's `UNWIND_INFO` is the number
-/// of entries of [`Pads`] and then the entries.
+/// pads. What follows the handler in the function's `UNWIND_INFO` is the image-relative
+/// address of the number of entries of [`Pads`], which the entries follow.
 fn personality(shim: &mut Shim<'_>) {
     let (record, frame, dispatch) = (shim.param(0), shim.param(1), shim.param(3));
     let [search, scan, check, next, found, sized, claim, arrive, enter, unwind, pass] =
@@ -392,6 +485,8 @@ fn personality(shim: &mut Shim<'_>) {
     let image = shim.load(I64, dispatch, 8);
     let entry = shim.load(I64, dispatch, 16);
     let pads = shim.load(I64, dispatch, 56);
+    let pads = shim.load_u32(pads, 0);
+    let pads = shim.builder.ins().iadd(image, pads);
     let begin = shim.load_u32(entry, 0);
     let start = shim.builder.ins().iadd(image, begin);
     let returned = shim.builder.ins().isub(control, start);

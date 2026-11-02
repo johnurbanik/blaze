@@ -129,7 +129,7 @@ pub(crate) fn function(
     let relocs = names.view().try_map_in(frame, |&name| reloc_target(key, name, requests, &datas, resolve))?;
     let unwind = match &code.unwind {
         Some(unwind) => {
-            let personality = || resolve.symbol(PERSONALITY);
+            let personality = |name: &str| resolve.symbol(name);
             let (unwind, lsda) = super::unwind::convert(isa, unwind, personality)?;
             if let Some(lsda) = lsda {
                 own.push(lsda);

@@ -1067,6 +1067,11 @@ impl Line<'_> {
     }
 
     fn library(&mut self, name: &str, kind: NativeLibKind, verbatim: bool) -> Result<(), LinkError> {
+        // The `libc` crate's C runtime: a `+verbatim` option of link.exe, which names a library.
+        let (name, verbatim) = match name.strip_prefix("/defaultlib:") {
+            Some(library) => (library, library.ends_with(".lib")),
+            None => (name, verbatim),
+        };
         let (path, kind) = self.find(name, kind, verbatim)?;
         self.push(path, kind)
     }

@@ -751,6 +751,12 @@ fn target() -> Result<&'static isa::OwnedTargetIsa> {
     target_of(Features::BASELINE, Isa::Usual, false)
 }
 
+/// The object every Windows program links for its landing pads.
+pub fn seh_runtime_object() -> std::result::Result<Vec<u8>, String> {
+    let isa = target().map_err(|error| error.to_string())?;
+    unwind::seh::runtime_object(isa.clone())
+}
+
 /// [`target`] with `features`: what a function of that set is compiled with.
 pub(crate) fn target_with(features: Features) -> Result<&'static isa::OwnedTargetIsa> {
     target_of(features, Isa::Usual, false)
@@ -6393,19 +6399,23 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let type_desc = self.cg.declare_data_in_func(type_desc, self.builder.func);
         let type_desc = self.builder.ins().symbol_value(ptr(), type_desc);
         // 14 words: `_ThrowInfo` (4), `_CatchableTypeArray` (2) and `_CatchableType` (7).
-        let info = self.cg.define_data(
-            ConstBlob {
-                // alloc: once, for `panic_unwind`'s `throw_exception`; the static's bytes
-                bytes: vec![0; 56],
-                relocs: Vec::new(),    // alloc: empty, allocates nothing
-                fn_relocs: Vec::new(), // alloc: empty, allocates nothing
-                align: 8,
-                type_ids: Vec::new(), // alloc: empty, allocates nothing
-            },
-            true,
-        )?;
-        let info = self.cg.declare_data_in_func(info, self.builder.func);
-        let info = self.builder.ins().symbol_value(ptr(), info);
+        // A block of the process's heap, one per throw: it is read after this frame is gone, and
+        // the program has no place to free it from. A panic is rare and this is 56 bytes.
+        let mut sig = self.cg.make_signature();
+        sig.returns.push(AbiParam::new(ptr()));
+        let heap = self.cg.import("GetProcessHeap", &sig)?;
+        let heap = self.cg.declare_func_in_func(heap, self.builder.func);
+        let call = self.builder.ins().call(heap, &[]);
+        let heap = self.builder.inst_results(call)[0];
+        let mut sig = self.cg.make_signature();
+        sig.params.extend([AbiParam::new(ptr()), AbiParam::new(types::I32), AbiParam::new(ptr())]);
+        sig.returns.push(AbiParam::new(ptr()));
+        let alloc = self.cg.import("HeapAlloc", &sig)?;
+        let alloc = self.cg.declare_func_in_func(alloc, self.builder.func);
+        let flags = self.builder.ins().iconst(types::I32, 0);
+        let size_of_info = self.builder.ins().iconst(ptr(), 56);
+        let call = self.builder.ins().call(alloc, &[heap, flags, size_of_info]);
+        let info = self.builder.inst_results(call)[0];
         // The image's base is what `GetModuleHandleW(NULL)` gives.
         let mut sig = self.cg.make_signature();
         sig.params.push(AbiParam::new(ptr()));

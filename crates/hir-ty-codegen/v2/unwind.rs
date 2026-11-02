@@ -17,15 +17,15 @@ use cranelift_codegen::{
     isa::TargetIsa,
 };
 
-use crate::unwind::{FunctionUnwind, UnwindParts, eh_entry as entry};
+use crate::unwind::{FunctionUnwind, UnwindParts, eh_entry as entry, seh::Pads};
 
 /// `unwind` as v2 keeps it, with the data of its landing pads, if it has any. `personality`
-/// is the target of the routine that reads them.
+/// is the target of the symbol of the routine that reads them.
 pub(crate) fn convert(
     // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
     isa: &dyn TargetIsa,
     unwind: &FunctionUnwind,
-    personality: impl FnOnce() -> Result<Target, String>,
+    personality: impl FnOnce(&str) -> Result<Target, String>,
 ) -> Result<(Unwind, Option<Data>), String> {
     match unwind.v2_parts() {
         UnwindParts::Dwarf { fde, landing_pads } => {
@@ -34,7 +34,7 @@ pub(crate) fn convert(
             // alloc: the landing pads' data, kept with the code; `Data::new` owns its bytes
             let lsda = landing_pads.map(|pads| Data::new(4, pads.to_vec(), Relocs::new()));
             let personality = match lsda {
-                Some(_) => Some(personality()?),
+                Some(_) => Some(personality(crate::unwind::PERSONALITY)?),
                 None => None,
             };
             let unwind = Unwind::Dwarf {
@@ -53,12 +53,23 @@ pub(crate) fn convert(
             // alloc: the function's unwind info, kept with its code; `Unwind::Windows` owns it
             Ok((Unwind::Windows { info: info.to_vec(), handler: None, lsda: None }, None))
         }
-        UnwindParts::Windows { landing_pads: Some(_), .. } => Err(
-            // alloc: the error's message
-            "a Windows function with landing pads: v2 has no SEH handler data yet".to_owned(),
-        ),
+        UnwindParts::Windows { info, landing_pads: Some(pads), .. } => {
+            // alloc: the function's unwind info, kept with its code; `Unwind::Windows` owns it
+            let mut info = info.to_vec();
+            info[0] |= UNW_FLAG_EHANDLER << 3;
+            // alloc: the landing pads' data, kept with the code
+            let mut bytes = Vec::with_capacity(4 + pads.len());
+            bytes.extend_from_slice(&((pads.len() / Pads::ENTRY) as u32).to_le_bytes());
+            bytes.extend_from_slice(pads);
+            let lsda = Data::new(4, bytes, Relocs::new());
+            let handler = personality(crate::unwind::seh::PERSONALITY)?;
+            Ok((Unwind::Windows { info, handler: Some(handler), lsda: Some(lsda.id) }, Some(lsda)))
+        }
     }
 }
+
+/// `UNWIND_INFO`'s flag of a handler the unwinder asks while it searches.
+const UNW_FLAG_EHANDLER: u8 = 1;
 
 /// The CIE every function of the process's ISA shares, made and read back once: Cranelift's
 /// `create_systemv_cie` depends on the ISA alone.

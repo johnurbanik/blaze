@@ -6400,7 +6400,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let type_desc = self.builder.ins().symbol_value(ptr(), type_desc);
         // 14 words: `_ThrowInfo` (4), `_CatchableTypeArray` (2) and `_CatchableType` (7).
         // A block of the process's heap, one per throw: it is read after this frame is gone, and
-        // the program has no place to free it from. A panic is rare and this is 56 bytes.
+        // the program has no place to free it from. A panic is rare and this is 64 bytes: the
+        // table, then the image its offsets are from, which `_CxxThrowException` finds by
+        // the table's address and so does not find here (`seh::personality`).
         let mut sig = self.cg.make_signature();
         sig.returns.push(AbiParam::new(ptr()));
         let heap = self.cg.import("GetProcessHeap", &sig)?;
@@ -6413,7 +6415,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let alloc = self.cg.import("HeapAlloc", &sig)?;
         let alloc = self.cg.declare_func_in_func(alloc, self.builder.func);
         let flags = self.builder.ins().iconst(types::I32, 0);
-        let size_of_info = self.builder.ins().iconst(ptr(), 56);
+        let size_of_info = self.builder.ins().iconst(ptr(), 64);
         let call = self.builder.ins().call(alloc, &[heap, flags, size_of_info]);
         let info = self.builder.inst_results(call)[0];
         // The image's base is what `GetModuleHandleW(NULL)` gives.
@@ -6449,6 +6451,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         for (offset, word) in words {
             b.ins().store(MEM, word, info, offset);
         }
+        b.ins().store(MEM, base, info, 56);
         let (addr, _) = self.place(output)?;
         self.builder.ins().store(MEM, info, addr, 0);
         Ok(())

@@ -523,6 +523,10 @@ fn personality(shim: &mut Shim<'_>) {
 
     // The size is with the first of the types the object can be caught as.
     shim.builder.switch_to_block(sized);
+    // Our `ThrowInfo` is on the heap, in no image, so the thrower found none: the image is
+    // after it (`seh_throw_info`).
+    let beside = shim.load(I64, throw_info, 56);
+    let thrown_from = shim.builder.ins().select(thrown_from, thrown_from, beside);
     let types = shim.load_u32(throw_info, 12);
     let types = shim.builder.ins().iadd(thrown_from, types);
     let first = shim.load_u32(types, 4);

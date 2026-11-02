@@ -75,6 +75,8 @@ pub struct HirFrontend<'db> {
     /// How each origin's units build bodies: what a function's references are walked for and
     /// what a generic is shared under.
     units: Option<Units>,
+    /// The strategy of the build's profile: which panic runtime its programs link.
+    pub(crate) panic: blaze_codegen::settings::Panic,
     // dyn: `reached` once a level of the walk, `stopped` once a function compiled (2 ns
     // against its 50 to 200 µs), never per instruction
     checks: Option<&'db dyn BodyChecks>, // dyn: never per instruction, as above
@@ -248,7 +250,8 @@ const NO_POLICY: &str = "the front end was made with no policy (`HirFrontend::wi
 impl<'db> HirFrontend<'db> {
     /// `build_time` is shared: a daemon makes one a job and hands it to each unit's front end.
     pub fn new(databases: Databases<'db>, hashes: HashSource, build_time: std::sync::Arc<BuildTime>) -> Self {
-        HirFrontend { databases, hashes, build_time, units: None, checks: None, stop: None }
+        let panic = blaze_codegen::settings::Panic::Unwind;
+        HirFrontend { databases, hashes, build_time, units: None, panic, checks: None, stop: None }
     }
 
     /// The front end of a build that stops before its next function once `stop` is set: its
@@ -269,6 +272,7 @@ impl<'db> HirFrontend<'db> {
     /// function need, which list what its code calls as the units of its origin inline it.
     pub fn with_policy(mut self, policy: &Policy) -> Self {
         self.units = Some(Units::of(self.databases.db, policy));
+        self.panic = policy.profile.panic;
         self
     }
 

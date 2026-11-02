@@ -205,8 +205,16 @@ impl HirFrontend<'_> {
         // alloc: once a program, its crates
         let mut linked: Vec<Crate> = crate::linked_crates(db, [krate]).into_iter().collect();
         linked.sort_unstable_by_key(|it| blaze_query::db::AsId::as_id(it));
+        // std depends on both panic runtimes, which define the same symbols: as rustc, a
+        // program links the one of its strategy.
+        let other = match self.panic {
+            blaze_codegen::settings::Panic::Abort => "panic_unwind",
+            _ => "panic_abort",
+        };
         for linked in linked {
-            add_kept(db, homes, linked, listed);
+            if crate::fncache::crate_name(db, linked) != other {
+                add_kept(db, homes, linked, listed);
+            }
         }
         Ok(())
     }

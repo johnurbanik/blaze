@@ -102,6 +102,8 @@ enum Call {
     CcRandomGenerateBytes,
     SecRandomCopyBytes,
     Syscall,
+    /// A Win32 call of std that has nothing to do here, one run on one thread: its result.
+    Returns(u64),
 }
 
 impl Call {
@@ -148,6 +150,10 @@ impl Call {
             "CCRandomGenerateBytes" => Call::CcRandomGenerateBytes,
             "SecRandomCopyBytes" => Call::SecRandomCopyBytes,
             "syscall" => Call::Syscall,
+            // std's thread-locals on Windows: their destructors are never run in a macro.
+            "FlsAlloc" | "FlsSetValue" | "FlsFree" | "TlsAlloc" | "TlsSetValue" | "TlsFree" => Call::Returns(1),
+            "GetLastError" | "SetLastError" | "FlsGetValue" | "TlsGetValue" => Call::Returns(0),
+            "GetCurrentThreadId" | "GetProcessHeap" => Call::Returns(1),
             _ => return None,
         })
     }
@@ -156,8 +162,10 @@ impl Call {
     fn of_std(name: &str, module: &str) -> Option<Call> {
         Some(match (name, module) {
             // `sys/random/mod.rs` on macOS, `sys/random/linux.rs` on Linux.
-            ("hashmap_random_keys", "random" | "linux") => Call::HashmapRandomKeys,
+            ("hashmap_random_keys", "random" | "linux" | "windows") => Call::HashmapRandomKeys,
             ("environ", "unix") => Call::Environ,
+            // sys/thread_local/guard/windows.rs: what is registered is never run in a macro.
+            ("enable", "windows") => Call::Returns(0),
             _ => return None,
         })
     }
@@ -302,6 +310,14 @@ impl<'a> Os<'a> {
         args: &[&[u8]],
         ret: &mut [u8],
     ) -> Done {
+        if let Call::Returns(value) = shim.call {
+            put_word(ret, value);
+            return Ok(Answer::Answered);
+        }
+        // Fixed keys: nothing of the system.
+        if shim.call == Call::HashmapRandomKeys {
+            return Ok(random::hashmap_random_keys(ret));
+        }
         let Some(t) = shim.target else {
             // alloc: error path
             return Err(Stop(format!(
@@ -312,6 +328,7 @@ impl<'a> Os<'a> {
         };
         let g = guest;
         match shim.call {
+            Call::Returns(_) => unreachable!("answered above"),
             Call::Open => {
                 let flags = int(args, 1)?;
                 self.open(t, g, ret, (t.at_flags().fdcwd, word(args, 0)?, flags))

@@ -38,6 +38,9 @@ mod thread;
 
 pub(super) use thread::{Process, Resume, TlsData};
 
+/// `HeapAlloc`'s flag of a block zeroed.
+const HEAP_ZERO_MEMORY: u32 = 8;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EvalLangItem {
     BeginPanic,
@@ -103,7 +106,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         }
         let is_extern_c = match def.lookup(self.db).container {
             hir_def::ItemContainerId::ExternBlockId(block) => {
-                matches!(block.abi(self.db), ExternAbi::C { .. })
+                // `system` is what std declares Win32's functions with, and is C's on x86-64.
+                matches!(block.abi(self.db), ExternAbi::C { .. } | ExternAbi::System { .. })
             }
             _ => false,
         };
@@ -612,6 +616,35 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let size = from_bytes!(usize, size.get(self)?);
                 let addr = self.c_allocate(size, false)?;
                 self.write_pointer(destination.addr, addr)
+            }
+            // std's allocator on Windows.
+            "HeapAlloc" => {
+                let [_, flags, size] = args else {
+                    return Err(MirEvalError::InternalError("HeapAlloc args are not provided".into()));
+                };
+                let zeroed = from_bytes!(u32, flags.get(self)?) & HEAP_ZERO_MEMORY != 0;
+                let size = from_bytes!(usize, size.get(self)?);
+                let addr = self.c_allocate(size, zeroed)?;
+                self.write_pointer(destination.addr, addr)
+            }
+            "HeapReAlloc" => {
+                let [_, _, ptr, size] = args else {
+                    return Err(MirEvalError::InternalError("HeapReAlloc args are not provided".into()));
+                };
+                let ptr = self.read_pointer(ptr.interval.addr)?;
+                let size = from_bytes!(usize, size.get(self)?);
+                let addr = self.reallocate(ptr, size.max(1), Origin::C, "HeapReAlloc")?;
+                self.write_pointer(destination.addr, addr)
+            }
+            "HeapFree" => {
+                let [_, _, ptr] = args else {
+                    return Err(MirEvalError::InternalError("HeapFree args are not provided".into()));
+                };
+                let ptr = self.read_pointer(ptr.interval.addr)?;
+                if ptr.to_usize() != 0 {
+                    self.deallocate(ptr, Origin::C, "HeapFree")?;
+                }
+                self.write_memory(destination.addr, &1i32.to_le_bytes())
             }
             "calloc" => {
                 let [count, size] = args else {

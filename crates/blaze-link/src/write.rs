@@ -494,6 +494,12 @@ impl Reloc<'_> {
         if let What::Got { target, .. } = what {
             if matches!(self.column.value(target), Ok(Value::Import(_))) {
                 field.fill(0);
+                // A cell of a PE image's import address table: the loader takes a DLL whose
+                // first cell is zero for one with nothing to import, and writes every cell
+                // from the lookup table whatever it holds.
+                if self.got_by_library && !field.is_empty() {
+                    field[0] = 1;
+                }
                 return Ok(());
             }
         }
@@ -831,13 +837,25 @@ impl<'a> Stage<'a> {
                     cells = Some(id);
                     continue;
                 }
+                // An empty section, as the MSVC runtime's objects have: nothing to write, and
+                // where it is may be inside the piece it was placed with.
+                if piece.size == 0 && piece.fixups().is_empty() {
+                    continue;
+                }
                 let offset = piece.addr - space.region.addr;
                 let field: &mut [u8] = if full {
                     let Some(skip) = offset.checked_sub(taken[region as usize]) else {
                         return Err(error(
                             function_of(piece),
                             // alloc: error path
-                            format!("{} overlaps the piece before it", symbols.describe(piece.sym)),
+                            format!(
+                                "{} overlaps the piece before it: region {region} ({:?}), offset {offset:#x}, size {:#x}, what {:?}, the piece before ends at {:#x}",
+                                symbols.describe(piece.sym),
+                                space.region.addr,
+                                piece.size,
+                                piece.what(),
+                                taken[region as usize],
+                            ),
                         ));
                     };
                     let buffer = std::mem::take(&mut rest[region as usize]);

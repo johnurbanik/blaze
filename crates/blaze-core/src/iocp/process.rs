@@ -216,6 +216,16 @@ fn run(launch: &Launch<'_>, command: &Command, n: u64) -> io::Result<Handles> {
     Ok((process, thread, job, stdin, stdout, stderr))
 }
 
+/// `text` as Windows names it: the daemon's paths have the drive as their first part (`/C:/a`
+/// is `C:\a`), which a process it starts does not understand. Anything else is as it is.
+fn host_path(text: &std::ffi::OsStr) -> OsString {
+    let drive = |bytes: &[u8]| bytes.len() >= 4 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' && bytes[3] == b'/';
+    match text.to_str() {
+        Some(path) if drive(path.as_bytes()) => OsString::from(path[1..].replace('/', "\\")),
+        _ => text.to_owned(),
+    }
+}
+
 /// The process `launch` says, made with `flags`: its standard handles `standard` (null for
 /// none), inheriting `inherited` and nothing else (each inheritable, and open until the call
 /// returns). Its process and first thread.
@@ -228,8 +238,11 @@ pub(super) fn create(
     // alloc: what the process is started with, made once as it starts.
     let program = sys::wide(launch.program.as_os_str())?;
     let mut line = crate::create_process::command_line(launch.program, launch.args)?;
-    let env = crate::create_process::environment(launch.env)?;
-    let dir = sys::wide(launch.dir.as_os_str())?;
+    // alloc: per process, as above.
+    let env: Vec<(OsString, OsString)> =
+        launch.env.iter().map(|(name, value)| (name.clone(), host_path(value))).collect();
+    let env = crate::create_process::environment(&env)?;
+    let dir = sys::wide(&host_path(launch.dir.as_os_str()))?;
     let attributes = Attributes::new(inherited)?;
     // SAFETY: all zeros is a valid `STARTUPINFOEXW` before its fields are set.
     let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };

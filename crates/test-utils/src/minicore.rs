@@ -50,6 +50,7 @@
 //!     include_bytes:
 //!     index: sized
 //!     infallible:
+//!     int_bounds:
 //!     int_impl: size_of, transmute
 //!     iterator: option
 //!     iterators: iterator, fn
@@ -708,6 +709,7 @@ pub mod ops {
     // region:drop
     #[lang = "drop"]
     pub trait Drop {
+        #[rustc_default_body_unstable(feature = "pin_ergonomics", issue = "130494")]
         fn drop(&mut self) {
             // region:pin
             Drop::pin_drop(crate::pin::Pin::new(self))
@@ -1860,7 +1862,35 @@ pub mod result {
                 Err(e) => op(e),
             }
         }
+
+        pub fn map_err<F, O: FnOnce(E) -> F>(self, op: O) -> Result<T, F> {
+            match self {
+                Ok(t) => Ok(t),
+                Err(e) => Err(op(e)),
+            }
+        }
         // endregion:fn
+
+        // region:option
+        pub fn ok(self) -> crate::option::Option<T> {
+            match self {
+                Ok(t) => crate::option::Option::Some(t),
+                Err(_) => crate::option::Option::None,
+            }
+        }
+        // endregion:option
+
+        // region:default
+        pub fn unwrap_or_default(self) -> T
+        where
+            T: crate::default::Default,
+        {
+            match self {
+                Ok(t) => t,
+                Err(_) => T::default(),
+            }
+        }
+        // endregion:default
     }
 }
 // endregion:result
@@ -2647,6 +2677,34 @@ impl_int! {
     isize i8 i16 i32 i64 i128
 }
 // endregion:int_impl
+
+// region:int_bounds
+macro_rules! impl_int_bounds {
+    ($($t:ty: $min:literal, $max:literal;)*) => {
+        $(
+            impl $t {
+                pub const MIN: Self = $min;
+                pub const MAX: Self = $max;
+            }
+        )*
+    }
+}
+
+impl_int_bounds! {
+    usize: 0, 0xFFFF_FFFF_FFFF_FFFF;
+    u8: 0, 0xFF;
+    u16: 0, 0xFFFF;
+    u32: 0, 0xFFFF_FFFF;
+    u64: 0, 0xFFFF_FFFF_FFFF_FFFF;
+    u128: 0, 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF;
+    isize: -9223372036854775808, 9223372036854775807;
+    i8: -128, 127;
+    i16: -32768, 32767;
+    i32: -2147483648, 2147483647;
+    i64: -9223372036854775808, 9223372036854775807;
+    i128: -170141183460469231731687303715884105728, 170141183460469231731687303715884105727;
+}
+// endregion:int_bounds
 
 // region:error
 pub mod error {

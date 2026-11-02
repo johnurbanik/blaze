@@ -702,8 +702,8 @@ fn exempt() {
 mod fiber_boundary {
     use base_db::FileId;
     use blaze_diagnostics::emit::{Sources, Style};
+    use blaze_hash::HashMap;
     use hir_expand::fixture;
-    use rustc_hash::FxHashMap;
 
     use crate::{
         check::{Setup, check},
@@ -747,7 +747,7 @@ pub mod sched {
                 .into_iter()
                 .find(|it| it.display_name(&db).is_some_and(|it| it.to_string() == linted))
                 .expect("the fixture has the crate linted");
-            let mut names: FxHashMap<FileId, String> = FxHashMap::default();
+            let mut names: HashMap<FileId, String> = HashMap::default();
             let mut texts = Vec::new();
             for krate in hir::Crate::all(&db) {
                 for module in krate.modules(&db) {
@@ -771,6 +771,7 @@ pub mod sched {
             let found = check(&db, krate, &setup, &name_of).expect("every file of the crates is named");
             let mut sources = Sources::of(texts);
             crate::serve::written(found.iter(), &mut sources, |_| None, Style::default())
+                .expect("every file a lint points into is given")
                 .into_iter()
                 .map(|it| it.rendered)
                 .collect()
@@ -978,4 +979,19 @@ pub fn run() {
             "main",
         );
     }
+}
+
+/// The compile's registry has blaze's lints and group as this crate has them, in the same
+/// order, so a level set for one in the build is known there and only this crate gives it.
+#[test]
+fn the_registry_has_blazes_lints_and_group_as_here() {
+    use blaze_diagnostics::lints::registry;
+    let registered: Vec<&str> =
+        registry::blaze_lints().iter().filter(|it| it.is_externally_loaded).map(|it| it.name).collect();
+    let here: Vec<String> = super::Lint::ALL.iter().map(|it| format!("blaze::{}", it.name())).collect();
+    assert_eq!(registered, here);
+    let hot = registry::group("blaze::hot").expect("the registry's `blaze::hot`");
+    let hot: Vec<&str> = hot.lints.iter().map(|it| it.name).collect();
+    let here: Vec<String> = super::HOT.iter().map(|it| format!("blaze::{}", it.name())).collect();
+    assert_eq!(hot, here);
 }

@@ -13,6 +13,7 @@ use std::{
 };
 
 use base_db::{Db, FxIndexSet};
+use blaze_hash::HashMap;
 use cfg::CfgOptions;
 use either::Either;
 use hir_expand::{
@@ -25,7 +26,6 @@ use hir_expand::{
 use intern::{Symbol, sym};
 use itertools::Itertools;
 use rustc_abi::ExternAbi;
-use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use span::{AstIdMap, RealSpanMap, SyntaxContext};
 use syntax::{
@@ -206,6 +206,9 @@ pub(super) fn lower_body(
                                 collector.collect_pat_top(Some(pat))
                             }
                         }
+                        // An anonymous parameter (2015 `fn f(String) {}`) binds nothing, as
+                        // rustc's `PatKind::Missing` is a wildcard to its THIR.
+                        None if param.ty().is_some() => collector.store.alloc_pat(Pat::Wild),
                         None => collector.missing_pat(),
                     };
                     params.push(Param::new(param_pat));
@@ -633,7 +636,7 @@ pub struct ExprCollector<'db> {
 
     /// Legacy (`macro_rules!`) macros can have multiple definitions and shadow each other,
     /// and we need to find the current definition. So we track the number of definitions we saw.
-    current_block_legacy_macro_defs_count: FxHashMap<Name, usize>,
+    current_block_legacy_macro_defs_count: HashMap<Name, usize>,
 
     current_try_block: Option<TryBlock>,
 
@@ -703,16 +706,16 @@ enum PatBoundCtx {
 #[derive(Debug)]
 struct BindingList {
     /// Inline for a pattern with at most one or-pattern level open.
-    ctxs: SmallVec<[(PatBoundCtx, FxHashMap<(Name, HygieneId), BindingId>); 2]>,
-    is_used: FxHashMap<BindingId, bool>,
+    ctxs: SmallVec<[(PatBoundCtx, HashMap<(Name, HygieneId), BindingId>); 2]>,
+    is_used: HashMap<BindingId, bool>,
     reject_new: bool,
 }
 
 impl Default for BindingList {
     fn default() -> Self {
         BindingList {
-            ctxs: SmallVec::from_iter([(PatBoundCtx::Product, FxHashMap::default())]),
-            is_used: FxHashMap::default(),
+            ctxs: SmallVec::from_iter([(PatBoundCtx::Product, HashMap::default())]),
+            is_used: HashMap::default(),
             reject_new: false,
         }
     }
@@ -750,7 +753,7 @@ impl BindingList {
     }
 
     fn push(&mut self, ctx: PatBoundCtx) {
-        self.ctxs.push((ctx, FxHashMap::default()));
+        self.ctxs.push((ctx, HashMap::default()));
     }
 
     /// Ends the innermost context, moving its bindings to the one around it.
@@ -946,7 +949,7 @@ impl<'db> ExprCollector<'db> {
             current_try_block: None,
             is_lowering_coroutine: false,
             awaitable_context: None,
-            current_block_legacy_macro_defs_count: FxHashMap::default(),
+            current_block_legacy_macro_defs_count: HashMap::default(),
             outer_impl_trait: false,
             krate,
             name_generator_index: 0,

@@ -23,7 +23,8 @@ use crate::serve::observe;
 
 const EXPLORE_USAGE: &str = "blaze explore [--dev] [--print]: the explorer's link, opened in the browser (`--print`: printed only; \
                              `--dev`: the page's development server, http://localhost:5173, may connect too)";
-const DEBUG_USAGE: &str = "blaze debug profile [--seconds N] | blaze debug live | blaze debug sql [--live] [--last SECONDS] [--json] QUERY";
+const DEBUG_USAGE: &str = "blaze debug profile [--seconds N] | blaze debug live | blaze debug sql [--live] [--last SECONDS] [--json] QUERY \
+                           | blaze debug hot [--top N] [--last-build]";
 const EXPLAIN_USAGE: &str = "blaze explain VIEW [NAME=VALUE ...] [--json]";
 
 /// `blaze explore`: the daemon's explorer started if it is not, its link printed (it carries
@@ -76,9 +77,42 @@ pub fn debug(words: Vec<OsString>, color: bool) -> i32 {
             Some(word) => Err(Refusal::Usage(format!("blaze debug live takes nothing, not `{}`", word.to_string_lossy()))),
         },
         Some("sql") => query(words.collect()),
+        Some("hot") => hot(words.collect()),
         _ => Err(Refusal::Usage(DEBUG_USAGE.to_owned())),
     };
     said(result, color)
+}
+
+/// `blaze debug hot [--top N] [--last-build]`: the N keys (20) that took most time and each
+/// kind of wait's quantiles, from the daemon's live sketches, since it began or over its last
+/// build.
+fn hot(words: Vec<OsString>) -> Result<(), Refusal> {
+    let (mut top, mut since) = (20u32, blaze_api::HotSince::Start);
+    let mut words = texts(words)?.into_iter();
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            "--last-build" => since = blaze_api::HotSince::LastBuild,
+            "--top" => {
+                top = words
+                    .next()
+                    .and_then(|it| it.parse().ok())
+                    .ok_or_else(|| Refusal::Usage("`--top` takes a number of keys".to_owned()))?;
+            }
+            _ => return Err(Refusal::Usage(format!("blaze debug hot [--top N] [--last-build], not `{word}`"))),
+        }
+    }
+    let mut text = String::new();
+    ask(Request::Hot { top, since }, Start::Never, |response| {
+        if let ResponseRef::Hot(hot) = response {
+            blaze_ui::api::hot_lines(&mut text, &hot);
+        }
+        Ok(())
+    })?;
+    if text.is_empty() {
+        return Err(Refusal::Failed("the daemon answered `blaze debug hot` with no answer".to_owned()));
+    }
+    print!("{text}");
+    Ok(())
 }
 
 /// `blaze explain VIEW [NAME=VALUE ...] [--json]`: the view's SQL with its arguments bound,
@@ -121,7 +155,7 @@ fn texts(words: Vec<OsString>) -> Result<Vec<String>, Refusal> {
 
 /// `request` asked of the daemon, each response but its errors handed to `on`; the daemon's
 /// errors, and a Done not ok, are the error. With [`Start::Never`], no daemon running is one.
-fn ask(request: Request, start: Start, mut on: impl FnMut(ResponseRef<'_>) -> Result<(), String>) -> Result<(), String> {
+pub(super) fn ask(request: Request, start: Start, mut on: impl FnMut(ResponseRef<'_>) -> Result<(), String>) -> Result<(), String> {
     let mut client = match daemon::connect(start) {
         Ok(Some(client)) => client,
         Ok(None) => return Err("no daemon is running: a build, or `blaze serve`, starts one".to_owned()),

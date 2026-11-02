@@ -6,16 +6,17 @@ use std::{
     fmt,
     ptr::{self, NonNull},
     sync::{
-        Mutex, OnceLock, PoisonError,
+        OnceLock,
         atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering},
     },
 };
 
 use blaze_graph::{Key, pump::Flights};
 use blaze_mem::Tag;
+use parking_lot::Mutex;
 
 use super::{
-    Event, EventKind,
+    Event, EventKind, counts,
     dense::{Dense, Heap},
     id::{Id, MAX_PAGES, PAGE_BITS, PAGE_LEN},
     ingredient::{self, Ingredient, MAX_INGREDIENTS},
@@ -434,9 +435,9 @@ impl Storage {
         if self.keep {
             return;
         }
-        let count = self.lru.get_mut().unwrap_or_else(PoisonError::into_inner).len();
+        let count = self.lru.get_mut().len();
         for at in 0..count {
-            let index = self.lru.get_mut().unwrap_or_else(PoisonError::into_inner)[at];
+            let index = self.lru.get_mut()[at];
             if let Some(sweep) = ingredient::vtable(index).and_then(|it| it.sweep) {
                 sweep(self, index);
             }
@@ -444,16 +445,27 @@ impl Storage {
     }
 
     pub(crate) fn add_lru(&self, index: u32) {
-        self.lru.lock().unwrap_or_else(PoisonError::into_inner).push(index);
+        self.lru.lock().push(index);
     }
 
     /// The ingredient that owns `id`'s page.
     #[inline]
     pub fn owner(&self, id: Id) -> Option<u32> {
+        if id.page() >= MAX_PAGES {
+            return None;
+        }
         match self.owners.get(id.page()).load(Ordering::Acquire) {
             0 => None,
             owner => Some(owner),
         }
+    }
+
+    /// Whether `id` is an interned value's: its page's owner is an interned ingredient, and its
+    /// slot was interned. False for every other `id`: one from outside (a persisted `u32`, a
+    /// proc-macro server's answer) is checked with this before `interned_fields` panics on it.
+    pub fn made(&self, id: Id) -> bool {
+        let Some(owner) = self.owner(id) else { return false };
+        ingredient::vtable(owner).and_then(|it| it.made).is_some_and(|made| made(self, owner, id))
     }
 
     pub fn ingredient_name(&self, ingredient: u32) -> &'static str {
@@ -545,10 +557,26 @@ impl Storage {
     }
 
     /// Records that memo `node` runs in this view because of `cause`: its flight holder's one
-    /// store before the run, read back by [`Storage::provenance`].
+    /// store before the run, read back by [`Storage::provenance`]. A run in the view it last
+    /// ran in counts as [`counts::RERAN`].
     #[inline]
     pub(crate) fn record_run(&self, node: u32, cause: Cause) {
-        self.runs.get(node as usize).store(cause.word(self.view), Ordering::Relaxed);
+        let run = self.runs.get(node as usize);
+        let was = run.load(Ordering::Relaxed);
+        run.store(cause.word(self.view), Ordering::Relaxed);
+        if ((was >> 32) as u32) & VIEW_MASK == self.view {
+            let (index, _, _) = key_parts(self.key_of(node));
+            counts::count(index, counts::RERAN);
+        }
+    }
+
+    /// What each ingredient's rows did since the last call, in every database of this process
+    /// (ingredients are numbered process-wide), summed over threads: `each(name, executed,
+    /// verified, reran)` per ingredient that did anything, named as its query is. Executed is a
+    /// run, verified a row proved unchanged in a view without running, reran a run in a view
+    /// the row had already run in.
+    pub fn take_counts(&self, each: impl FnMut(&str, u64, u64, u64)) {
+        counts::take(each);
     }
 
     /// Copies `edges` into the edge array: a span for a row or a capture.
@@ -662,7 +690,7 @@ impl Storage {
     #[cold]
     #[inline(never)]
     fn make_table<T: Table>(&self, index: u32) -> &T {
-        let _one = self.making.lock().unwrap_or_else(PoisonError::into_inner);
+        let _one = self.making.lock();
         if let Some(table) = self.table::<T>(index) {
             return table;
         }
@@ -815,7 +843,7 @@ impl Ids {
         heap: &Heap,
         layout: (usize, usize),
     ) -> usize {
-        let _one = self.making.lock().unwrap_or_else(PoisonError::into_inner);
+        let _one = self.making.lock();
         self.pages.ensure(k + 1);
         if let page @ 1.. = self.pages.get(k).load(Ordering::Acquire) {
             return page as usize;

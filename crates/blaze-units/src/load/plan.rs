@@ -1,6 +1,7 @@
 //! Each unit's plan: what the pinned nightly's cargo (`cad07cf8e597397fff5d0f6cb79c9f870c0b1dd2`)
 //! hashes, passes rustc, sets and writes for it, computed as cargo computes it. Nothing here
-//! reads a file: the manifests, the config and the standard library's facts come in.
+//! reads a file but `cargo clippy`'s configuration files, through the config's view: the
+//! manifests, the config and the standard library's facts come in.
 
 mod env;
 mod flags;
@@ -19,13 +20,13 @@ use blaze_manifest::manifest::Manifest;
 use blaze_manifest::profiles::{Profile as BaseProfile, ProfileRoot};
 use blaze_manifest::targets::TargetKind;
 use blaze_resolve::PackageId;
-use rustc_hash::{FxHashMap, FxHashSet};
+use blaze_hash::{HashMap, HashSet};
 
 use self::flags::KindInfo;
 use self::hash::{CompileMode, HashedProfile, LtoUnit, Meta, MetaInput, RustcVersion, TrimPaths};
 use self::outputs::{CompileFiles, Layout};
 use crate::load::load_error;
-use crate::query::{LoadError, UnitPlan};
+use crate::query::{Clippy, LoadError, UnitPlan};
 use crate::schema::Unit;
 use crate::stdlib::target as platform;
 use crate::{Intent, Package};
@@ -39,13 +40,16 @@ pub(crate) struct PlanInput<'a, F: Files> {
     /// The standard library's units' plans, made by its own load; `None` for every other unit.
     pub std_plans: &'a [Option<UnitPlan>],
     /// Every package of the units, by the unit's `pkg_id`.
-    pub packages: &'a FxHashMap<String, (PackageId, Package<'a>)>,
+    pub packages: &'a HashMap<String, (PackageId, Package<'a>)>,
     /// Every package's manifest path, by its id.
-    pub manifests: &'a FxHashMap<PackageId, (&'a Path, &'a Manifest)>,
+    pub manifests: &'a HashMap<PackageId, (&'a Path, &'a Manifest)>,
     /// The graph's roots, as indexes of `units`.
     pub roots: &'a [usize],
     pub config: &'a Config<F>,
     pub intent: Intent,
+    /// `check`'s: the workspace's crates linted, each given `--cfg clippy` and the
+    /// configuration file clippy finds for it.
+    pub lints: bool,
     /// Whether the standard library is built (`-Zbuild-std`): only then do its units' hashes
     /// go into their dependents'.
     pub build_std: bool,
@@ -67,7 +71,7 @@ pub(crate) struct PlanInput<'a, F: Files> {
     pub jobs: Option<u32>,
     /// The packages, by the unit's `pkg_id`, whose build scripts run outside the sandbox
     /// (`UnitPlan::unsandboxed`).
-    pub unsandboxed: &'a FxHashSet<&'a str>,
+    pub unsandboxed: &'a HashSet<&'a str>,
 }
 
 pub(crate) struct PlanOutput {
@@ -207,6 +211,36 @@ fn manifest_target<'a>(manifest: &'a Manifest, kind: &TargetKind, name: &str) ->
         .iter()
         .find(|it| it.name == name && same(&it.kind))
         .ok_or_else(|| error(format!("`{}` has no {kind:?} target `{name}`", manifest.package_id.name)))
+}
+
+/// The configuration file clippy's driver finds for the package of `manifest_path`, with its
+/// text (`clippy_config::lookup_conf_file`): `.clippy.toml`, then `clippy.toml`, in
+/// `CLIPPY_CONF_DIR` (from the workspace's root, where cargo runs it, when relative) or the
+/// package's directory, then in each directory above.
+fn clippy_conf<F: Files>(input: &PlanInput<'_, F>, manifest_path: &Path) -> Result<Option<(String, String)>, LoadError> {
+    const NAMES: [&str; 2] = [".clippy.toml", "clippy.toml"];
+    let files = input.config.files();
+    let start = match input.config.env("CLIPPY_CONF_DIR") {
+        Some(dir) => input.ws_root.join(dir),
+        None => manifest_path.parent().unwrap_or(manifest_path).to_owned(),
+    };
+    let start = files
+        .canonicalize(&start)
+        .map_err(|why| error(format!("clippy's configuration is looked for from `{}`: {why}", start.display())))?;
+    for dir in start.ancestors() {
+        for name in NAMES {
+            let path = dir.join(name);
+            if !files.is_file(&path) {
+                continue;
+            }
+            let shown = path.display().to_string();
+            let bytes = files.read(&path).map_err(|why| error(format!("error reading `{shown}`: {why}")))?;
+            let text = String::from_utf8(bytes.into_owned())
+                .map_err(|_| error(format!("error reading `{shown}`: stream did not contain valid UTF-8")))?;
+            return Ok(Some((shown, text)));
+        }
+    }
+    Ok(None)
 }
 
 fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadError> {
@@ -376,9 +410,9 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
     for &at in input.roots {
         roots[at] = true;
     }
-    let primary: FxHashSet<&str> = input.roots.iter().map(|&at| units[at].pkg_id.as_str()).collect();
-    let mut per_package: FxHashMap<&str, PackageFlags> =
-        FxHashMap::with_capacity_and_hasher(input.packages.len(), Default::default());
+    let primary: HashSet<&str> = input.roots.iter().map(|&at| units[at].pkg_id.as_str()).collect();
+    let mut per_package: HashMap<&str, PackageFlags> =
+        HashMap::with_capacity_and_hasher(input.packages.len(), Default::default());
     let artifact_dir = !matches!(input.intent, Intent::Check { .. } | Intent::Doc { .. });
 
     let mut plans = Vec::with_capacity(units.len());
@@ -454,6 +488,7 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
                 unsandboxed,
                 runner: Vec::new(),
                 harness: target.harness,
+                clippy: None,
             }));
             continue;
         }
@@ -514,12 +549,22 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
 
         let name = it.pkg.id.name();
         let rustflags = flags::unit_rustflags(&unit.profile.rustflags, &unit.profile.panic, name.as_str(), &info.rustflags)?;
+        let mut cfgs = flags::cfgs(&unit.profile.rustflags, &unit.features, &info.rustflags);
+        // As cargo-clippy wraps the workspace's rustc (`RUSTC_WORKSPACE_WRAPPER`): the
+        // workspace's crates, not the registry's.
+        let clippy = match input.lints && it.pkg.is_member && !unit.is_std {
+            true => {
+                cfgs.push("clippy".to_owned());
+                Some(Clippy { conf: clippy_conf(input, it.pkg.manifest_path)? })
+            }
+            false => None,
+        };
         plans.push(Some(UnitPlan {
             checked_as_test: unit.checked_as_test,
             metadata: meta.metadata(),
             extra_filename: meta.extra_filename(),
             unit_id: meta.unit_id(),
-            cfgs: flags::cfgs(&unit.profile.rustflags, &unit.features, &info.rustflags),
+            cfgs,
             check_cfg,
             rustflags,
             lints,
@@ -534,6 +579,7 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
                 _ => Vec::new(),
             },
             harness: target.harness,
+            clippy,
         }));
     }
 

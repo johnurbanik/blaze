@@ -8,12 +8,14 @@ use std::{
     ops::Range,
 };
 
-use base_db::{Db, ConstEvalBudget, Crate};
+use base_db::{ConstEvalBudget, Crate, Db};
+use blaze_hash::{HashMap, HashSet};
+use blaze_hashcons::Interned;
 use either::Either;
 use hir_def::{
     AdtId, DefWithBodyId, EnumVariantId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId,
     VariantId,
-    expr_store::{Body, HygieneId},
+    expr_store::HygieneId,
     item_tree::FieldsShape,
     lang_item::LangItems,
     layout::{TagEncoding, Variants},
@@ -29,17 +31,15 @@ use rustc_apfloat::{
     ieee::{Double, Half as f16, Quad as f128, Single},
 };
 use rustc_ast_ir::Mutability;
-use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::{SmallVec, smallvec};
 use rustc_type_ir::{
     AliasTyKind,
     inherent::{GenericArgs as _, IntoKind, SliceLike, Ty as _},
 };
+use smallvec::{SmallVec, smallvec};
 use triomphe::Arc;
-use blaze_hashcons::Interned;
 
 use crate::{
-    CallableDefId, ComplexMemoryMap, InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate,
+    CallableDefId, ComplexMemoryMap, InferBodyId, MemoryMap, ParamEnvAndCrate,
     PointerAt,
     consteval::{self, ConstEvalError, try_const_usize},
     db::{AnonConstId, GeneralConstId, HirDatabase, InternedClosureId},
@@ -75,10 +75,8 @@ mod threads;
 mod unwind;
 
 use hooks::Hooks;
+use machine::{Access, EvalThread, Machine, MemKind, Plain, Ptr, RetagMode, Shadow, Site, TypedCx};
 use provenance::Provenance;
-use machine::{
-    Access, EvalThread, Machine, MemKind, Plain, Ptr, RetagMode, Shadow, Site, TypedCx,
-};
 
 macro_rules! from_bytes {
     // A `usize` of the target, which is as wide as what holds it.
@@ -268,6 +266,9 @@ enum Origin {
     Machine,
     /// An anonymous `mmap`, freed only by `munmap`.
     Mmap,
+    /// C's heap (`malloc`, `calloc`, `posix_memalign`, `realloc`), freed by `free`: what std's
+    /// `System` allocator asks for.
+    C,
 }
 
 impl Origin {
@@ -278,6 +279,7 @@ impl Origin {
             Origin::ConstHeap { .. } => MemKind::ConstHeap,
             Origin::Machine => MemKind::Machine,
             Origin::Mmap => MemKind::Mmap,
+            Origin::C => MemKind::C,
         }
     }
 }
@@ -332,12 +334,12 @@ impl std::ops::Deref for VariantLayout {
 /// The provenances the machine gave the evaluation's pointers, each once, by [`ProvId`].
 struct Provs<P> {
     list: Vec<P>,
-    index: FxHashMap<P, u32>,
+    index: HashMap<P, u32>,
 }
 
 impl<P> Default for Provs<P> {
     fn default() -> Self {
-        Provs { list: Vec::new(), index: FxHashMap::default() } // alloc: empty, allocates nothing
+        Provs { list: Vec::new(), index: HashMap::default() } // alloc: empty, allocates nothing
     }
 }
 
@@ -358,15 +360,15 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     heap_blocks: BTreeMap<usize, HeapBlock>,
     /// The offsets of freed heap blocks, by size class and alignment, for the next block of
     /// that class and alignment.
-    free_blocks: FxHashMap<(usize, usize), Vec<usize>>,
+    free_blocks: HashMap<(usize, usize), Vec<usize>>,
     /// Where a promoted temporary of a body (`&[1, 2]`) is: in the heap, as its borrow
     /// outlives the call, once for every call of the body.
-    promoted: FxHashMap<(usize, LocalId), Address>,
+    promoted: HashMap<(usize, LocalId), Address>,
     /// Whether dropping a value of a type does anything ([`Self::has_drop_glue`]).
-    drop_glue: FxHashMap<Ty<'db>, bool>,
+    drop_glue: HashMap<Ty<'db>, bool>,
     /// Where the value of a constant operand is, once read: the program never writes it, so
     /// every use of the constant reads the same copy.
-    constants: FxHashMap<Either<Const<'db>, Allocation<'db>>, Interval>,
+    constants: HashMap<Either<Const<'db>, Allocation<'db>>, Interval>,
     code_stack: Vec<StackFrame<'db>>,
     /// Emptied `code_stack`s, for the nested runs of [`Self::interpret_mir`].
     spare_code_stacks: Vec<Vec<StackFrame<'db>>>,
@@ -392,7 +394,7 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     /// The running thread's destructors to call when its start function returns.
     at_exit: Vec<(usize, Address)>,
     /// The running thread's `#[thread_local]` statics, as [`Self::static_locations`].
-    thread_statics: FxHashMap<StaticId, Address>,
+    thread_statics: HashMap<StaticId, Address>,
     /// What the thread shims keep for the whole process: pthread keys, signal actions.
     process: shim::Process,
     /// The virtual clock, in nanoseconds since the run started.
@@ -414,17 +416,23 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     panic_handler: std::cell::OnceCell<Option<FunctionId>>,
     /// Stores the global location of the statics. We const evaluate every static first time we need it
     /// and see it's missing, then we add it to this to reuse.
-    static_locations: FxHashMap<StaticId, Address>,
+    static_locations: HashMap<StaticId, Address>,
     /// The memory of each evaluated static, as start and size.
     static_memory: Vec<(usize, usize, StaticId)>,
     /// The statics whose value is read, when the others are left unevaluated: a static that
     /// is only pointed to needs no value, and may itself point back at the one being
     /// evaluated. `None` evaluates every static that is named.
-    read_statics: Option<FxHashSet<StaticId>>,
+    read_statics: Option<HashSet<StaticId>>,
     /// Heap memory standing in for the statics left unevaluated, as start and size.
     unevaluated_statics: Vec<(usize, usize, StaticId)>,
     /// The unevaluated static whose memory was read, which fails the evaluation.
     missing_static: Cell<Option<StaticId>>,
+    /// Evaluating at compile time (the body of a constant or static, or a const macro) rather
+    /// than running a function: no extern static has a value then.
+    compile_time: bool,
+    /// Heap memory standing in for the extern statics named at compile time, as start and
+    /// size: their address is known, their value is not.
+    extern_statics: Vec<(usize, usize, StaticId)>,
     /// Running a static's initializer, where the memory of every static is read-only, as in
     /// rustc.
     in_static: bool,
@@ -436,16 +444,16 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     random_state: blaze_rng::SplitMix64,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
-    layout_cache: RefCell<FxHashMap<Ty<'db>, Interned<'static, InternedLayout>>>,
-    projected_ty_cache: RefCell<FxHashMap<(PlaceTy<'db>, PlaceElem), PlaceTy<'db>>>,
-    not_special_fn_cache: RefCell<FxHashSet<FunctionId>>,
-    mir_or_dyn_index_cache: RefCell<FxHashMap<(FunctionId, GenericArgs<'db>), MirOrDynIndex<'db>>>,
+    layout_cache: RefCell<HashMap<Ty<'db>, Interned<'static, InternedLayout>>>,
+    projected_ty_cache: RefCell<HashMap<(PlaceTy<'db>, PlaceElem), PlaceTy<'db>>>,
+    not_special_fn_cache: RefCell<HashSet<FunctionId>>,
+    mir_or_dyn_index_cache: RefCell<HashMap<(FunctionId, GenericArgs<'db>), MirOrDynIndex<'db>>>,
     /// Constantly dropping and creating `Locals` is very costly. We store
     /// old locals that we normally want to drop here, to reuse their allocations
     /// later.
-    unused_locals_store: RefCell<FxHashMap<InferBodyId<'db>, Vec<Locals<'db>>>>,
+    unused_locals_store: RefCell<HashMap<InferBodyId<'db>, Vec<Locals<'db>>>>,
     /// [`Self::storage_marked`] of each body run under a machine, by the body's address.
-    storage_marked: RefCell<FxHashMap<usize, Arc<FxHashSet<LocalId>>>>,
+    storage_marked: RefCell<HashMap<usize, Arc<HashSet<LocalId>>>>,
     cached_ptr_size: usize,
     cached_fn_trait_func: Option<FunctionId>,
     cached_fn_mut_trait_func: Option<FunctionId>,
@@ -458,9 +466,15 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     budget: ConstEvalBudget,
     /// The steps of [`Self::budget`] not spent yet.
     steps_left: u64,
+    /// The most bytes of stack and heap together the evaluation has held.
+    memory_peak: u64,
     /// [`Self::steps_left`] once [`LINT_TERMINATOR_LIMIT`] steps are spent, when the evaluation
     /// is of a constant's or static's initializer; `u64::MAX`, which it never is, otherwise.
     lint_mark: u64,
+    /// The `-C overflow-checks` of the crate a run's code is compiled as, which a body that
+    /// inherits its checks takes ([`Self::set_inherited_overflow_checks`]). Unset, such a body
+    /// checks, as a constant's evaluation does.
+    inherited_overflow_checks: Option<bool>,
     /// An additional limit on stack depth, to prevent stack overflow
     stack_depth_limit: usize,
     /// Every call takes a frame of [`Self::stack_depth_limit`], which is the crate's recursion
@@ -750,7 +764,7 @@ pub fn interpret_mir<'db>(
     trait_env: Option<ParamEnvAndCrate<'db>>,
 ) -> Result<'db, (Result<'db, Allocation<'db>>, MirOutput)> {
     let ty = body.locals[return_slot()].ty.as_ref();
-    let mut read_statics = FxHashSet::default();
+    let mut read_statics = HashSet::default();
     loop {
         let mut evaluator = Evaluator::with_machine(
             db,
@@ -832,7 +846,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         // const eval, which cannot read them as integers, so no other value is computed from
         // an id's bytes: comparing two (`IS_UNIT` in core) and reflection's counts, sizes and
         // names are answered.
-        if !self.type_ids.is_empty() && !self.holds_no_type_id(ty, &mut FxHashSet::default()) {
+        if !self.type_ids.is_empty() && !self.holds_no_type_id(ty, &mut HashSet::default()) {
             let of = |it: &TypeIdOf<'db>| match *it {
                 TypeIdOf::Ty(ty) => Some(ty),
                 TypeIdOf::Field { .. } => None,
@@ -940,10 +954,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             heap: vec![0],
             stack_allocations: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
             heap_blocks: BTreeMap::new(),
-            free_blocks: FxHashMap::default(),
-            promoted: FxHashMap::default(),
-            drop_glue: FxHashMap::default(),
-            constants: FxHashMap::default(),
+            free_blocks: HashMap::default(),
+            promoted: HashMap::default(),
+            drop_glue: HashMap::default(),
+            constants: HashMap::default(),
             code_stack: vec![], // alloc: empty, allocates nothing; one per evaluation
             spare_code_stacks: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
             spare_args: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
@@ -956,7 +970,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             waiting: None,
             yielded: false,
             at_exit: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
-            thread_statics: FxHashMap::default(),
+            thread_statics: HashMap::default(),
             process: shim::Process::default(),
             clock: 0,
             wait_counter: 0,
@@ -973,6 +987,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             read_statics: None,
             unevaluated_statics: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
             missing_static: Cell::new(None),
+            compile_time: !matches!(
+                owner,
+                InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(_))
+            ),
+            extern_statics: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
             in_static: matches!(owner, InferBodyId::DefWithBodyId(DefWithBodyId::StaticId(_))),
             db,
             random_state: blaze_rng::SplitMix64::new(0),
@@ -988,7 +1007,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             limits_frames,
             budget,
             steps_left: budget.steps,
+            memory_peak: 0,
             lint_mark: lint_mark(limits_frames, budget.steps),
+            inherited_overflow_checks: None,
             layout_cache: RefCell::new(Default::default()),
             projected_ty_cache: RefCell::new(Default::default()),
             not_special_fn_cache: RefCell::new(Default::default()),
@@ -1207,10 +1228,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
     /// Whether arithmetic of the body being evaluated panics when it overflows. A function's
     /// does what the code compiled from it does. The initializer of a constant, a static or a
-    /// discriminant always checks, as rustc builds it, whatever `-C overflow-checks` says.
+    /// discriminant always checks, as rustc builds it, whatever `-C overflow-checks` says. A
+    /// function that inherits its checks takes those of the crate the run is compiled as.
     fn checks_overflow(&self, locals: &Locals<'db>) -> bool {
         !matches!(locals.body.owner, InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(_)))
-            || crate::mir::overflow::body_checks_overflow(self.db, locals.body).unwrap_or(true)
+            || crate::mir::overflow::body_checks_overflow(self.db, locals.body)
+                .unwrap_or(self.inherited_overflow_checks.unwrap_or(true))
     }
 
     fn operand_ty(&self, o: &Operand, locals: &Locals<'db>) -> Result<'db, Ty<'db>> {
@@ -1219,8 +1242,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             OperandKind::Constant { konst: _, ty } => ty.as_ref(),
             OperandKind::Allocation { allocation } => allocation.as_ref().ty,
             &OperandKind::Static(s) => {
-                let ty = InferenceResult::of(self.db, DefWithBodyId::from(s))
-                    .expr_ty(Body::of(self.db, s.into()).root_expr());
+                let ty = self.db.type_for_static(s).instantiate_identity().skip_norm_wip();
                 Ty::new_ref(
                     self.interner(),
                     Region::new_static(self.interner()),
@@ -1932,13 +1954,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     }
 
     /// The locals of `body` with storage statements, which are live only from a `StorageLive`.
-    fn storage_marked(&self, body: &'db MirBody<'db>) -> Arc<FxHashSet<LocalId>> {
+    fn storage_marked(&self, body: &'db MirBody<'db>) -> Arc<HashSet<LocalId>> {
         let key = std::ptr::from_ref(body) as usize;
         if let Some(it) = self.storage_marked.borrow().get(&key) {
             // clone: an `Arc`
             return it.clone();
         }
-        let marked: FxHashSet<LocalId> = body
+        let marked: HashSet<LocalId> = body
             .basic_blocks
             .iter()
             .flat_map(|(_, block)| &block.statements)
@@ -2889,8 +2911,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 if let AdtId::StructId(id) = current_adt.def_id()
                     && target_adt.def_id() == current_adt.def_id() =>
             {
-                let mut changed = None;
-                for (_, field) in self.db.field_types(id.into()).iter() {
+                // The field with bytes, changed or not: a cast from `Box<dyn A>` to `Box<dyn A>`
+                // changes none.
+                let fields = id.fields(self.db).fields();
+                let mut pointer = None;
+                for (field_id, field) in self.db.field_types(id.into()).iter() {
                     let from =
                         field.ty().instantiate(self.interner(), current_subst).skip_norm_wip();
                     let to = field.ty().instantiate(self.interner(), target_subst).skip_norm_wip();
@@ -2899,17 +2924,21 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     if self.layout(from)?.size.bytes_usize() == 0 {
                         continue;
                     }
-                    if from == to {
+                    let name = fields[field_id].name.as_str();
+                    if let Some((first, first_from, first_to)) = pointer.replace((name, from, to)) {
                         // The cast widens the value's bytes as one pointer.
-                        not_supported!("unsizing a struct with bytes beside its pointer");
-                    }
-                    if changed.replace((from, to)).is_some() {
-                        not_supported!("unsizing a struct whose cast changes two fields");
+                        not_supported!(
+                            "unsizing `{current:?}` to `{target:?}`: two of its fields have bytes, \
+                             `{first}` (`{first_from:?}` to `{first_to:?}`) and `{name}` \
+                             (`{from:?}` to `{to:?}`), and the cast widens one pointer"
+                        );
                     }
                 }
-                match changed {
-                    Some((from, to)) => self.coerce_unsized_pointees(from, to),
-                    None => Err(MirEvalError::CoerceUnsizedError(current.store())),
+                match pointer {
+                    Some((_, from, to)) => self.coerce_unsized_pointees(from, to),
+                    None => not_supported!(
+                        "unsizing `{current:?}` to `{target:?}`: none of its fields has bytes"
+                    ),
                 }
             }
             _ => Err(MirEvalError::CoerceUnsizedError(current.store())),
@@ -2948,6 +2977,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     not_supported!("slice unsizing from non array type {t:?}")
                 }
             },
+            // From `dyn A` (to itself, or upcast) the pointer keeps its vtable, as rustc's
+            // `unsized_info` keeps it for one principal: a vtable here names the concrete type,
+            // which answers every trait of it.
+            TyKind::Dynamic(..) if matches!(current_ty.kind(), TyKind::Dynamic(..)) => {
+                IntervalOrOwned::Borrowed(addr)
+            }
             TyKind::Dynamic(..) => {
                 let vtable = self.vtable_map.id(current_ty);
                 self.with_metadata(addr, &word_bytes(vtable))?
@@ -3725,9 +3760,20 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             .unevaluated_statics
             .iter()
             .find(|&&(start, len, _)| pos < start + len && start < pos + size);
+        if let Some(&(.., id)) = read {
+            self.missing_static.set(Some(id));
+            not_supported!("reading a static that was left unevaluated");
+        }
+        let read = self
+            .extern_statics
+            .iter()
+            .find(|&&(start, len, _)| pos < start + len && start < pos + size);
         let Some(&(.., id)) = read else { return Ok(()) };
-        self.missing_static.set(Some(id));
-        not_supported!("reading a static that was left unevaluated")
+        // alloc: error path
+        Err(MirEvalError::NotSupported(format!(
+            "cannot access extern static `{}` at compile time",
+            StaticSignature::of(self.db, id).name.as_str()
+        )))
     }
 
     /// Fails a write to the memory of a static from a static's initializer.
@@ -4093,16 +4139,17 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         map.note_align(addr, align);
     }
 
-    /// Whether `more` bytes of stack or heap fit the evaluation's budget.
-    fn check_memory(&self, more: usize) -> Result<'db, ()> {
+    /// Whether `more` bytes of stack or heap fit the evaluation's budget; when they do, the
+    /// total they make counts toward [`Self::memory_peak`].
+    fn check_memory(&mut self, more: usize) -> Result<'db, ()> {
         let used = self.stack.len() as u64 + self.heap.len() as u64;
-        if (more as u64).checked_add(used).is_none_or(|it| it > self.budget.memory) {
-            return Err(MirEvalError::OverBudget {
-                spent: Budget::Memory(self.budget.memory),
-                at: None,
-            });
+        match (more as u64).checked_add(used) {
+            Some(total) if total <= self.budget.memory => {
+                self.memory_peak = self.memory_peak.max(total);
+                Ok(())
+            }
+            _ => Err(MirEvalError::OverBudget { spent: Budget::Memory(self.budget.memory), at: None }),
         }
-        Ok(())
     }
 
     /// Memory of the evaluator's own ([`Origin::Evaluator`]), zeroed.
@@ -4196,19 +4243,25 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         Ok(())
     }
 
-    /// `__rust_realloc`: the block grows or shrinks in place while it fits its size class,
-    /// else its bytes move to a new block and it is freed.
-    fn reallocate(&mut self, addr: Address, new_size: usize) -> Result<'db, Address> {
+    /// `__rust_realloc`, or C's `realloc` for [`Origin::C`] (`what`): the block grows or
+    /// shrinks in place while it fits its size class, else its bytes move to a new block and
+    /// it is freed.
+    fn reallocate(
+        &mut self,
+        addr: Address,
+        new_size: usize,
+        origin: Origin,
+        what: &str,
+    ) -> Result<'db, Address> {
         let block = match addr.at() {
             Heap(pos) => self.heap_blocks.get(&pos).copied().map(|it| (pos, it)),
             _ => None,
         };
-        let Some((pos, block)) = block.filter(|(_, it)| it.origin == Origin::Allocator) else {
-            return Err(MirEvalError::UndefinedBehavior(
-                "`__rust_realloc` of a pointer that is not the start of memory allocated by it"
-                    // alloc: error path
-                    .to_owned(),
-            ));
+        let Some((pos, block)) = block.filter(|(_, it)| it.origin == origin) else {
+            // alloc: error path
+            return Err(MirEvalError::UndefinedBehavior(format!(
+                "`{what}` of a pointer that is not the start of memory allocated by it"
+            )));
         };
         // The machine sees a reallocation as rustc's evaluation does: a new block, the bytes
         // that fit copied to it, the old one freed.
@@ -4219,11 +4272,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             self.heap_blocks.insert(pos, HeapBlock { size: new_size, ..block });
             return Ok(addr);
         }
-        let new = self.allocate(new_size, block.align, Origin::Allocator, false)?;
+        let new = self.allocate(new_size, block.align, origin, false)?;
         let kept = block.size.min(new_size);
         Interval { addr: new, size: kept }
             .write_from_interval(self, Interval { addr, size: kept })?;
-        self.deallocate(addr, Origin::Allocator, "__rust_realloc")?;
+        self.deallocate(addr, origin, what)?;
         Ok(new)
     }
 
@@ -4309,7 +4362,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// Whether no value of the type has a `TypeId` in it or behind its references. A type
     /// this cannot see through, as a raw pointer or a `dyn`, is taken to have one; one met
     /// again in `seen`, through a reference to itself, adds nothing.
-    fn holds_no_type_id(&self, ty: Ty<'db>, seen: &mut FxHashSet<Ty<'db>>) -> bool {
+    fn holds_no_type_id(&self, ty: Ty<'db>, seen: &mut HashSet<Ty<'db>>) -> bool {
         if !seen.insert(ty) {
             return true;
         }
@@ -4649,7 +4702,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
     fn patch_addresses(
         &mut self,
-        patch_map: &FxHashMap<usize, usize>,
+        patch_map: &HashMap<usize, usize>,
         source: &MemoryMap<'db>,
         ty_of_bytes: impl Fn(&[u8]) -> Result<'db, Ty<'db>> + Copy,
         addr: Address,
@@ -5410,11 +5463,30 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             let Some((size, align)) = self.size_align_of(ty, locals)? else {
                 not_supported!("unsized extern static");
             };
-            // Zeroed: an `extern_weak` one is unresolved, so std's `Option<fn>` for
-            // `__cxa_thread_atexit_impl` is `None` and it registers thread-local destructors
-            // through a pthread key, which the thread shims run.
+            let weak = hir_def::attrs::AttrFlags::linkage(self.db, st.into())
+                .is_some_and(|it| it.as_str() == "extern_weak");
+            if !self.compile_time && !weak {
+                // alloc: error path
+                return Err(MirEvalError::NotSupported(format!(
+                    "extern static `{}`, which only the linked program has",
+                    static_data.name.as_str()
+                )));
+            }
             let addr = self.heap_allocate(size, align)?;
-            Interval::new(addr, size)
+            let result = Interval::new(addr, size);
+            if self.compile_time {
+                // Its address is a value at compile time; reading it is not (rustc's
+                // `ExternStatic`), which `check_static_is_evaluated` refuses.
+                if let Heap(start) = addr.at() {
+                    self.extern_statics.push((start, size, st));
+                }
+            } else {
+                // Null: an `extern_weak` one is unresolved, so std's `Option<fn>` for
+                // `__cxa_thread_atexit_impl` is `None` and it registers thread-local destructors
+                // through a pthread key, which the thread shims run.
+                self.initialized(result);
+            }
+            result
         };
         self.record_static(result.addr, result.size, st)?;
         self.locate_static(st, result.addr)
@@ -5937,9 +6009,8 @@ impl IntValue {
             (16, false) => Self::U128(u128::from_le_bytes(bytes.try_into().unwrap())),
             (16, true) => Self::I128(i128::from_le_bytes(bytes.try_into().unwrap())),
             (len, is_signed) => {
-                // alloc: error path
                 return Err(MirEvalError::InternalError(
-                    format!("an integer operand of {len} bytes, signed: {is_signed}").into(),
+                    format!("an integer operand of {len} bytes, signed: {is_signed}").into(), // alloc: error path
                 ));
             }
         })

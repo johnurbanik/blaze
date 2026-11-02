@@ -8,14 +8,12 @@ use std::{
     hash::{BuildHasher, Hash},
     marker::PhantomData,
     mem::MaybeUninit,
-    sync::{
-        Mutex, PoisonError,
-        atomic::{AtomicU32, AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
+use blaze_hash::FixedState;
 use blaze_mem::{Tag, swiss};
-use rustc_hash::FxBuildHasher;
+use parking_lot::Mutex;
 
 use super::{
     DatabaseKeyIndex, EventKind, Id, MemoryUsage,
@@ -104,6 +102,7 @@ impl Vtable {
             fields: &[],
             row_size: size_of::<InternRow<I::Fields>>(),
             ids_of: Some(ids_of::<I> as fn(&Storage, u32, Id, &mut Vec<Id>)),
+            made: Some(made::<I> as fn(&Storage, u32, Id) -> bool),
             memory: memory::<I>,
             verify: None,
             reset: None,
@@ -118,7 +117,7 @@ impl Vtable {
 /// The hash every interned value is keyed by: what [`intern_by`]'s `Q` must hash like.
 #[inline]
 pub(crate) fn hash_of<Q: Hash + ?Sized>(value: &Q) -> u64 {
-    FxBuildHasher.hash_one(value)
+    FixedState.hash_one(value)
 }
 
 #[inline]
@@ -216,7 +215,7 @@ fn insert<F, K>(
     eq: impl Fn(&F, &K) -> bool,
     make: impl FnOnce(K) -> F,
 ) -> (Id, Option<K>) {
-    let mut len = shard.len.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut len = shard.len.lock();
     if let Some(id) = find(table, shard, hash, |row| eq(row, &key)) {
         return (id, Some(key));
     }
@@ -269,6 +268,10 @@ pub(crate) fn fields_of<F: Send + Sync + 'static>(
 /// The name of the function whose hidden key `id` is, if it is one.
 pub fn interned_arguments(storage: &Storage, id: Id) -> Option<&'static str> {
     storage.ingredient_name(storage.owner(id)?).strip_suffix(ARGUMENTS)
+}
+
+fn made<I: Interned>(storage: &Storage, index: u32, id: Id) -> bool {
+    fields_of::<I::Fields>(storage, index, id).is_some()
 }
 
 fn ids_of<I: Interned>(storage: &Storage, index: u32, id: Id, out: &mut Vec<Id>) {

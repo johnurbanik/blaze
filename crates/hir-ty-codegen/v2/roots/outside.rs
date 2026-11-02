@@ -11,7 +11,7 @@
 use std::borrow::Cow;
 
 use base_db::Db;
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 
 use super::{
     super::{HirFrontend, HirInstance, Kind, places::Ref, refs, statics},
@@ -37,7 +37,7 @@ struct Visit<'db> {
 struct Graph<'a, 'f, 'db> {
     frontend: &'a HirFrontend<'f>,
     /// Each node, a [`Ref::Function`] or [`Ref::Static`], by its place.
-    places: FxHashMap<Ref, u32>,
+    places: HashMap<Ref, u32>,
     visits: Vec<Visit<'db>>,
     /// Tarjan's stack: the nodes of the components not yet done.
     stack: Vec<u32>,
@@ -54,7 +54,7 @@ pub(super) fn of<'db>(
     let mut graph = Graph {
         frontend,
         // alloc: once a harness, sized by the program it reaches
-        places: FxHashMap::default(),
+        places: HashMap::default(),
         // alloc: as above
         visits: Vec::new(),
         // alloc: as above
@@ -155,7 +155,7 @@ impl<'db> Graph<'_, '_, 'db> {
     ) -> Result<(bool, Cow<'db, [Ref]>), String> {
         let names = match node {
             Ref::Function(instance) => match &instance.0 {
-                Kind::Asm(_) => return Ok((true, Cow::Borrowed(&[]))),
+                Kind::Asm(..) => return Ok((true, Cow::Borrowed(&[]))),
                 // The walk without MIR inlining reaches what the one with does, through the
                 // callees it inlines.
                 _ => refs::listed(db, instance, false)?,

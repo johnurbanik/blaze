@@ -25,13 +25,13 @@
 
 mod body;
 
+use blaze_hash::{HashMap, HashSet};
 use either::Either;
 use hir::{HirFileId, InFile, ModuleDef, PathResolution};
 use hir_def::{
-    AdtId, AttrDefId, DefWithBodyId, FieldId, attrs::AttrFlags, builtin_derive::BuiltinDeriveImplTrait,
-    expr_store::Body,
+    AdtId, AttrDefId, DefWithBodyId, FieldId, attrs::AttrFlags,
+    builtin_derive::BuiltinDeriveImplTrait, expr_store::Body,
 };
-use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use syntax::{
     SyntaxKind, SyntaxNodePtr, T,
@@ -53,10 +53,10 @@ use crate::{
 pub(super) struct Live {
     live: DefSet,
     /// The closures and anonymous constants walked, which items in them have as their parent.
-    anon: FxHashSet<InFile<SyntaxNodePtr>>,
+    anon: HashSet<InFile<SyntaxNodePtr>>,
     /// rustc's `ignored_derived_traits`: of each ADT, the traits of the derives whose impls
     /// were not walked, in the order they were met.
-    pub(super) ignored: FxHashMap<DefIdx, SmallVec<[&'static str; 2]>>,
+    pub(super) ignored: HashMap<DefIdx, SmallVec<[&'static str; 2]>>,
 }
 
 impl Live {
@@ -102,7 +102,7 @@ pub(super) fn live(k: &Crate<'_, '_, '_>, seeds: Seeds) -> (Liveness, Vec<Found>
         ignore_variants: Vec::new(), // alloc: setup, one stack for the whole walk
         repr_all_live: false,
         repr_simd: false,
-        self_assigns: FxHashSet::default(),
+        self_assigns: HashSet::default(),
         found: Vec::new(), // alloc: the pass's output, once per crate
     };
     let mut unsolved = seeds.unsolved;
@@ -124,7 +124,7 @@ struct Mark<'k, 'c, 'a, 'db> {
     ignore_variants: Vec<DefIdx>,
     repr_all_live: bool,
     repr_simd: bool,
-    self_assigns: FxHashSet<InFile<SyntaxNodePtr>>,
+    self_assigns: HashSet<InFile<SyntaxNodePtr>>,
     found: Vec<Found>,
 }
 
@@ -234,6 +234,14 @@ impl<'db> Mark<'_, '_, '_, 'db> {
             }
             Id::Variant(_) | Id::Field(_) => return,
             _ => {}
+        }
+        if let Parent::Def(impl_) = d.parent
+            && let Some(&name) = defs.trivial_derives.get(&impl_)
+        {
+            if let Some(adt) = defs.impl_of(impl_).and_then(|it| it.self_adt) {
+                self.ignore(adt, name);
+            }
+            return;
         }
         let Some(ptr) = d.node else { return };
         let saved = (self.repr_all_live, self.repr_simd);
@@ -358,10 +366,7 @@ impl<'db> Mark<'_, '_, '_, 'db> {
                     BuiltinDeriveImplTrait::Clone => "Clone",
                     _ => "Debug",
                 };
-                let ignored = self.live.ignored.entry(adt).or_default();
-                if !ignored.contains(&name) {
-                    ignored.push(name);
-                }
+                self.ignore(adt, name);
             }
             BuiltinDeriveImplTrait::PartialEq
             | BuiltinDeriveImplTrait::PartialOrd
@@ -396,6 +401,15 @@ impl<'db> Mark<'_, '_, '_, 'db> {
             | BuiltinDeriveImplTrait::CoerceUnsized
             | BuiltinDeriveImplTrait::DispatchFromDyn
             | BuiltinDeriveImplTrait::Reborrow => {}
+        }
+    }
+
+    /// `should_ignore_item` of a method of a derive of a `rustc_trivial_field_reads` trait: not
+    /// walked, the trait kept for `adt`'s note.
+    fn ignore(&mut self, adt: DefIdx, name: &'static str) {
+        let ignored = self.live.ignored.entry(adt).or_default();
+        if !ignored.contains(&name) {
+            ignored.push(name);
         }
     }
 

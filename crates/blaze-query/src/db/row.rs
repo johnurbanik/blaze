@@ -29,13 +29,11 @@ use std::{
     cell::UnsafeCell,
     mem::MaybeUninit,
     ptr::NonNull,
-    sync::{
-        Mutex, PoisonError,
-        atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering},
 };
 
 use blaze_mem::Tag;
+use parking_lot::Mutex;
 
 use super::{
     dense::{Dense, Heap, MAX_ALIGN},
@@ -194,10 +192,11 @@ impl Pages {
         if let Some(at) = NonNull::new(self.page(page)) {
             return at;
         }
-        let _one = self.grow.lock().unwrap_or_else(PoisonError::into_inner);
+        let _one = self.grow.lock();
         if let Some(at) = NonNull::new(self.page(page)) {
             return at;
         }
+        assert!(page != 0, "a row page for ID page 0, which no ingredient is ever given");
         assert!(align <= MAX_ALIGN, "a row aligned to more than {MAX_ALIGN} bytes");
         let at = heap.alloc(PAGE_LEN * size, align.max(8));
         // Release: a reader that loads the page sees its zeroes, and whatever the maker

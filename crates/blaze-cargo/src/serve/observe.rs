@@ -15,10 +15,6 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
     thread::JoinHandle,
     time::Duration,
 };
@@ -52,6 +48,62 @@ pub fn duckdb(value: Option<std::ffi::OsString>) -> Result<Option<PathBuf>, Stri
         Ok(_) => Err(format!("{DUCKDB}={} is not a file", path.display())),  // alloc: error path
         Err(error) => Err(format!("{DUCKDB}={}: {error}", path.display())),  // alloc: error path
     }
+}
+
+/// `blaze debug hot`'s answer: the daemon's live sketches ([`blaze_profile::hot::read`]) in the
+/// API's terms.
+pub fn hot(top: u32, since: blaze_api::HotSince) -> Result<blaze_api::Hot, ApiError> {
+    use blaze_api::{HotFunction, HotKey, HotSince, HotWait, HotWaitKind};
+    use blaze_graph::wait::WaitKind;
+    use blaze_profile::hot;
+    let read = hot::read(top as usize, match since {
+        HotSince::Start => hot::Since::Start,
+        HotSince::LastBuild => hot::Since::LastBuild,
+    })
+    // alloc: error path
+    .map_err(|error| ApiError::new(error.to_string(), Some("blaze debug hot --last-build".to_owned())))?;
+    let keys = read
+        .keys
+        .into_iter()
+        .map(|it| HotKey {
+            span: it.span.to_owned(),  // alloc: the answer's copy, once a request
+            function: match it.function {
+                hot::Function::None => HotFunction::None,
+                hot::Function::Named(name) => HotFunction::Named(name.as_ref().to_owned()),  // alloc: as above
+                hot::Function::Forgotten(sym) => HotFunction::Forgotten(sym),
+            },
+            lower_ns: it.lower_ns,
+            upper_ns: it.upper_ns,
+        })
+        .collect();  // alloc: the answer's rows, once a request
+    let waits = read
+        .waits
+        .iter()
+        .map(|it| HotWait {
+            kind: match it.kind {
+                WaitKind::Key => HotWaitKind::Key,
+                WaitKind::Lock => HotWaitKind::Lock,
+                WaitKind::Channel => HotWaitKind::Channel,
+                WaitKind::Io => HotWaitKind::Io,
+                WaitKind::Child => HotWaitKind::Child,
+                WaitKind::Scope => HotWaitKind::Scope,
+            },
+            count: it.count,
+            max_ns: it.max_ns,
+            p50_ns: it.p50_ns,
+            p90_ns: it.p90_ns,
+            p99_ns: it.p99_ns,
+        })
+        .collect();  // alloc: the answer's rows, once a request
+    Ok(blaze_api::Hot {
+        keys,
+        torn: read.torn,
+        since,
+        spans: read.spans,
+        waits,
+        error_ns: read.error_ns,
+        total_ns: read.total_ns,
+    })
 }
 
 /// The profile history and the DuckDB that queries it, as `blaze serve` gives them to its
@@ -168,10 +220,10 @@ struct Subscriber {
     frame: Frame,
 }
 
-/// A live SQL query running on its thread: `stop` kills its DuckDB.
+/// A live SQL query running on its thread: a message on `stop` kills its DuckDB.
 struct Querying {
     to: RequestRef,
-    stop: Arc<AtomicBool>,
+    stop: crossbeam_channel::Sender<()>,
 }
 
 /// What a query's thread answered.
@@ -278,9 +330,9 @@ impl Observe {
             let what = format!("the daemon was started with no {DUCKDB}: `nix run .#duckdb` names the DuckDB it runs");  // alloc: error path
             return fail(out, to, ApiError::new(what, Some("blaze debug sql --live".to_owned())));  // alloc: error path
         };
-        let stop = Arc::new(AtomicBool::new(false));  // alloc: once a query
+        let (stop, stopped) = crossbeam_channel::bounded(1);  // alloc: once a query
         // clone: once a query, for its thread
-        let (duckdb, dir, stopped, answered) = (duckdb.clone(), profiling.dir.clone(), Arc::clone(&stop), self.answered_to.clone());
+        let (duckdb, dir, answered) = (duckdb.clone(), profiling.dir.clone(), self.answered_to.clone());
         let window = Duration::from_secs(u64::from(last_s));
         let spawned = std::thread::Builder::new().name("blaze-sql".to_owned()).spawn(move || {  // alloc: once a query
             let query = sql::Query { duckdb: &duckdb, history: &dir, sql: &sql };
@@ -300,7 +352,7 @@ impl Observe {
     pub fn gone(&mut self, conn: Conn) {
         self.live.retain(|it| it.to.conn != conn);
         for querying in self.querying.iter().filter(|it| it.to.conn == conn) {
-            querying.stop.store(true, Ordering::Relaxed);
+            _ = querying.stop.try_send(());
         }
     }
 
@@ -361,7 +413,7 @@ impl Observe {
             out.push(Reply { to: it.to, response: Response::Done { ok: true } });
         }
         for querying in &self.querying {
-            querying.stop.store(true, Ordering::Relaxed);
+            _ = querying.stop.try_send(());
         }
         self.explorer = None;
     }

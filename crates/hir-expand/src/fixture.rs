@@ -51,21 +51,21 @@
 use std::{any::TypeId, str::FromStr, sync};
 
 use base_db::{
-    AbsPathBuf, ConstEvalBudget, ContentId, Crate, CrateDisplayName, CrateGraphBuilder,
-    CrateName, CrateOrigin, CrateWorkspaceData, Db, DependencyBuilder, Env, FileId, FileSet,
-    FxIndexMap, LangCrateOrigin, LibraryRoots, LocalRoots, SourceRoot, SourceRootId, TargetKind,
-    VfsPath, Version, ViewFile, ViewRoot, all_crates,
+    AbsPathBuf, ConstEvalBudget, ContentId, Crate, CrateDisplayName, CrateGraphBuilder, CrateName,
+    CrateOrigin, CrateWorkspaceData, Db, DependencyBuilder, Env, FileId, FileSet, FxIndexMap,
+    LangCrateOrigin, LibraryRoots, LocalRoots, SourceRoot, SourceRootId, TargetKind, Version,
+    VfsPath, ViewFile, ViewRoot, all_crates,
     target::{Arch, TargetData},
 };
+use blaze_hash::HashSet;
+use blaze_query::db::{Durability, Setter};
 use cfg::CfgOptions;
 use intern::{Symbol, sym};
 use itertools::Itertools;
-use rustc_hash::FxHashSet;
-use blaze_query::db::{Durability, Setter};
 use span::Edition;
 use test_utils::{
-    CURSOR_MARKER, ESCAPED_CURSOR_MARKER, Fixture as FixtureFile, FixtureWithProjectMeta,
-    MiniCore, RangeOrOffset, extract_range_or_offset,
+    CURSOR_MARKER, ESCAPED_CURSOR_MARKER, Fixture as FixtureFile, FixtureWithProjectMeta, MiniCore,
+    RangeOrOffset, extract_range_or_offset,
 };
 use triomphe::Arc;
 use tt::{Leaf, TokenTree, TopSubtree, TopSubtreeBuilder, TtElement, TtIter};
@@ -75,7 +75,7 @@ use crate::{
     builtin::quote::quote,
     files::FilePosition,
     proc_macro::{
-        CrateProcMacros, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError,
+        ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError,
         ProcMacroKind, ProcMacros, ProcMacrosBuilder,
     },
 };
@@ -128,7 +128,7 @@ pub fn db_with_proc_macros(
 /// a dependency: `proc_macros`, or `foo` of `crate:main deps:foo`.
 pub fn test_crate(db: &Db) -> Crate {
     let all = all_crates(db);
-    let depended_on: FxHashSet<Crate> = all
+    let depended_on: HashSet<Crate> = all
         .iter()
         .flat_map(|krate| krate.data(db).dependencies.iter().map(|dep| dep.crate_id))
         .collect();
@@ -229,11 +229,7 @@ impl Fixture {
     /// Gives `krate` the proc macros `macros` in place of those it had, as loading its dylib
     /// would: a fixture's own `crate:proc-macro:name` has none until it is given some.
     pub fn set_proc_macros(&mut self, krate: Crate, macros: Vec<ProcMacro>) {
-        let proc_macros = ProcMacros::get(&self.db);
-        let mut by_crate = proc_macros.by_crate(&self.db).clone();
-        by_crate.insert(krate, Arc::new(CrateProcMacros::new(Ok(macros))));
-        proc_macros.set_by_crate(&mut self.db).with_durability(Durability::HIGH).to(by_crate);
-        self.db.note_crates_changed();
+        ProcMacros::give(&mut self.db, [(krate, Ok(macros))]);
     }
 }
 
@@ -553,8 +549,8 @@ fn set_files(
 ) -> Vec<FileId> {
     let mut by_id = roots.to_vec();
     by_id.sort_unstable_by_key(|(id, _)| id.0);
-    let mut local = FxHashSet::default();
-    let mut library = FxHashSet::default();
+    let mut local = HashSet::default();
+    let mut library = HashSet::default();
     for (id, kind) in by_id {
         let root = match kind {
             SourceRootKind::Local => {

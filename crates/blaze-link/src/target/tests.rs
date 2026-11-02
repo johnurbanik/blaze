@@ -11,7 +11,7 @@ use super::{
     Ask, Cache, Located, Target, caseless, fhs, listing, loader, locate_with, output_with, parse_version, rpaths,
     top_level_string,
 };
-use crate::{Debug, Format, LinkError, NativeKind, Output, OutputKind, Platform};
+use crate::{Debug, Format, LinkError, NativeKind, Output, OutputKind, Platform, Searched};
 
 /// A machine that answers what it is told to: variables, and commands by their whole text.
 struct Answers {
@@ -57,6 +57,29 @@ impl Ask for Answers {
             })
             .collect()
     }
+
+    fn said(&self, program: &Path, args: &[String]) -> Result<String, String> {
+        let mut answers = self.run(program, &[args.to_vec()]);
+        answers.pop().unwrap()
+    }
+}
+
+/// How a C driver is asked for its linker's job.
+const DRIVER: &str = "cc -### -x c /dev/null";
+
+/// What a C driver's `-###` prints: its version, a compile job and its linker's job, which
+/// passes `dirs` with `-L` (the first as a separate word).
+fn jobs(dirs: &[&Path]) -> Result<String, String> {
+    let mut printed = "clang version 21.0.0\nTarget: arm64-apple-darwin\n \"/usr/bin/clang\" \"-cc1\" \"-o\" \"x.o\"\n".to_owned();
+    printed.push_str(r#" "/usr/bin/ld" "-demangle" "-o" "a.out""#);
+    for (at, dir) in dirs.iter().enumerate() {
+        match at {
+            0 => printed.push_str(&format!(r#" "-L" "{}""#, dir.display())),
+            _ => printed.push_str(&format!(r#" "-L{}""#, dir.display())),
+        }
+    }
+    printed.push_str(" \"-L.\" \"-Lrelative/lib\" \"x.o\" \"-lSystem\"\n");
+    Ok(printed)
 }
 
 fn temp(name: &str) -> PathBuf {
@@ -69,6 +92,21 @@ fn temp(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// A `.tbd` for AArch64 and x86-64 macOS whose install name is `install`, re-exporting the
+/// libraries `reexports`.
+fn stub(install: &str, reexports: &[&str]) -> Vec<u8> {
+    let mut text = format!("--- !tapi-tbd\ntbd-version: 4\ntargets: [ x86_64-macos, arm64-macos ]\ninstall-name: '{install}'\n");
+    if !reexports.is_empty() {
+        let libraries: Vec<String> = reexports.iter().map(|it| format!("'{it}'")).collect();
+        text.push_str(&format!(
+            "reexported-libraries:\n  - targets: [ x86_64-macos, arm64-macos ]\n    libraries: [ {} ]\n",
+            libraries.join(", ")
+        ));
+    }
+    text.push_str("...\n");
+    text.into_bytes()
 }
 
 fn touch(path: &Path, bytes: &[u8]) {
@@ -139,6 +177,7 @@ fn glibc(target: Target) -> Glibc {
     for (dir, file) in files {
         answers = answers.answer(format!("cc -print-file-name={file}"), Ok(format!("{}\n", dir.join(file).display())));
     }
+    let answers = answers.answer(DRIVER, jobs(&[]));
     Glibc { gcc, libc, loader, answers }
 }
 
@@ -230,7 +269,7 @@ fn a_macos_executable_says_its_sdk_and_the_minimum_os() {
         &sdk.join("SDKSettings.json"),
         br#"{"CanonicalName":"macosx15.2","VersionMap":{"Version":"1.0","macOS_iOSMac":{"15.2":"18.2"}},"Version":"15.2","MinimalDisplayName":"15.2"}"#,
     );
-    let answers = Answers::new().var("SDKROOT", sdk.display().to_string());
+    let answers = Answers::new().var("SDKROOT", sdk.display().to_string()).answer(DRIVER, jobs(&[]));
     let output = executable(&Cache::new(), &answers, "aarch64-apple-darwin").unwrap();
     assert_eq!((output.format, output.arch), (Format::MachO, Arch::Aarch64));
     assert_eq!(output.kind, OutputKind::Executable { entry: "main".to_owned() });
@@ -238,11 +277,17 @@ fn a_macos_executable_says_its_sdk_and_the_minimum_os() {
     assert_eq!((output.interpreter, output.stack), (None, None));
 
     for (given, minimum) in [("14.5", 0x000e_0500), ("10.9", 0x000b_0000), ("26", 0x001a_0000), ("15.1.2", 0x000f_0102)] {
-        let answers = Answers::new().var("SDKROOT", sdk.display().to_string()).var("MACOSX_DEPLOYMENT_TARGET", given);
+        let answers = Answers::new()
+            .var("SDKROOT", sdk.display().to_string())
+            .var("MACOSX_DEPLOYMENT_TARGET", given)
+            .answer(DRIVER, jobs(&[]));
         let output = executable(&Cache::new(), &answers, "aarch64-apple-darwin").unwrap();
         assert_eq!(output.platform.unwrap().minimum, minimum, "{given}");
     }
-    let answers = Answers::new().var("SDKROOT", sdk.display().to_string()).var("MACOSX_DEPLOYMENT_TARGET", "eleven");
+    let answers = Answers::new()
+        .var("SDKROOT", sdk.display().to_string())
+        .var("MACOSX_DEPLOYMENT_TARGET", "eleven")
+        .answer(DRIVER, jobs(&[]));
     let error = executable(&Cache::new(), &answers, "aarch64-apple-darwin").unwrap_err();
     assert!(error.what.contains("MACOSX_DEPLOYMENT_TARGET=eleven"), "{}", error.what);
 }
@@ -251,7 +296,9 @@ fn a_macos_executable_says_its_sdk_and_the_minimum_os() {
 fn without_sdkroot_the_sdk_is_where_xcrun_says() {
     let sdk = temp("xcrun");
     touch(&sdk.join("SDKSettings.json"), br#"{"Version": "14.0"}"#);
-    let answers = Answers::new().answer("xcrun --sdk macosx --show-sdk-path", Ok(format!("{}\n", sdk.display())));
+    let answers = Answers::new()
+        .answer("xcrun --sdk macosx --show-sdk-path", Ok(format!("{}\n", sdk.display())))
+        .answer(DRIVER, jobs(&[]));
     let output = executable(&Cache::new(), &answers, "aarch64-apple-darwin").unwrap();
     assert_eq!(output.platform.unwrap().sdk, 0x000e_0000);
 
@@ -348,6 +395,7 @@ fn debians_libgcc_s_script_is_followed_by_libgcc_s_so_1_and_libgcc() {
     for said in ["libgcc_s.so names -lnope", "libnope.so, libnope.a"] {
         assert!(error.what.contains(said), "{}", error.what);
     }
+    assert_eq!(error.not_found().map(|it| it.library.as_str()), Some("nope"), "the script's context keeps it typed");
 
     touch(&gcc.join("libgcc_s.so"), b"GROUP ( -l:libgcc_s.so.1 )");
     let located = locate_plain(&cache, &glibc.answers, &output, &[dylib("gcc_s")], &[]).unwrap();
@@ -412,7 +460,7 @@ fn the_toolchain_is_asked_once_per_environment() {
     let cache = Cache::new();
     executable(&cache, &glibc.answers, "x86_64-unknown-linux-gnu").unwrap();
     let asked = glibc.answers.asked();
-    assert_eq!(asked, 8, "the search directories and seven files");
+    assert_eq!(asked, 9, "the search directories, seven files and the linker's job");
     executable(&cache, &glibc.answers, "x86_64-unknown-linux-gnu").unwrap();
     locate_plain(&cache, &glibc.answers, &executable(&cache, &glibc.answers, "x86_64-unknown-linux-gnu").unwrap(), &[], &[])
         .unwrap();
@@ -444,12 +492,12 @@ fn no_c_toolchain_is_an_error_naming_what_was_tried() {
 fn a_macos_line_takes_tbds_before_dylibs_and_frameworks_from_the_sdk() {
     let sdk = temp("sdk-line");
     touch(&sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#);
-    let tbd = b"--- !tapi-tbd\ntbd-version: 4\n...\n";
+    let tbd = &stub("/usr/lib/libstub.dylib", &[]);
     touch(&sdk.join("usr/lib/libSystem.tbd"), tbd);
     touch(&sdk.join("usr/lib/libiconv.tbd"), tbd);
-    touch(&sdk.join("usr/lib/libiconv.dylib"), b"");
+    touch(&sdk.join("usr/lib/libiconv.dylib"), tbd);
     touch(&sdk.join("System/Library/Frameworks/CoreFoundation.framework/CoreFoundation.tbd"), tbd);
-    let answers = Answers::new().var("SDKROOT", sdk.display().to_string());
+    let answers = Answers::new().var("SDKROOT", sdk.display().to_string()).answer(DRIVER, jobs(&[]));
     let cache = Cache::new();
     let output = executable(&cache, &answers, "aarch64-apple-darwin").unwrap();
     let framework = NativeLib { name: "CoreFoundation".to_owned(), kind: NativeLibKind::Framework, verbatim: false };
@@ -463,6 +511,105 @@ fn a_macos_line_takes_tbds_before_dylibs_and_frameworks_from_the_sdk() {
             (sdk.join("usr/lib/libSystem.tbd"), shared),
         ]
     );
+}
+
+/// nix's dev shell on macOS: libiconv is not in the SDK, and cc-wrapper passes its directory
+/// to the linker from `NIX_LDFLAGS`, as rustc's link through `cc` gets it.
+#[test]
+fn a_library_only_on_a_path_the_c_driver_passes_its_linker_is_found() {
+    let sdk = temp("sdk-driver");
+    touch(&sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#);
+    touch(&sdk.join("usr/lib/libSystem.tbd"), &stub("/usr/lib/libSystem.B.dylib", &[]));
+    let (nix, profile, mine) = (temp("nix-libiconv"), temp("nix-profile"), temp("mine"));
+    touch(&nix.join("libiconv.dylib"), &stub("/nix/libiconv.dylib", &[]));
+    touch(&profile.join("libiconv.dylib"), &stub("/profile/libiconv.dylib", &[]));
+    let missing = nix.join("missing");
+    let answers =
+        Answers::new().var("SDKROOT", sdk.display().to_string()).answer(DRIVER, jobs(&[&nix, &missing, &profile]));
+    let cache = Cache::new();
+    let output = executable(&cache, &answers, "aarch64-apple-darwin").unwrap();
+    let search = [mine.clone()];
+    let located = locate_plain(&cache, &answers, &output, &[dylib("iconv")], &search).unwrap();
+    let shared = NativeKind::Shared { as_needed: false };
+    assert_eq!(
+        line(&located),
+        [(nix.join("libiconv.dylib"), shared), (sdk.join("usr/lib/libSystem.tbd"), shared)],
+        "the first directory the driver passes, after the link's own and before the SDK's"
+    );
+
+    let error = locate_plain(&cache, &answers, &output, &[dylib("nope")], &search).unwrap_err();
+    let found = error.not_found().expect("a typed not-found");
+    assert_eq!(found.library, "nope");
+    assert_eq!(found.files, ["libnope.tbd", "libnope.dylib", "libnope.so", "libnope.a"]);
+    assert_eq!(
+        found.searched,
+        [
+            (mine.clone(), Searched::Link),
+            (nix.clone(), Searched::CDriver),
+            (profile.clone(), Searched::CDriver),
+            (sdk.join("usr/lib"), Searched::Toolchain),
+            (sdk.join("usr/local/lib"), Searched::Toolchain),
+        ],
+        "every directory searched, in order; one that is missing or relative is not passed"
+    );
+    assert!(error.what.contains(&format!("{} (the C driver's linker -L)", nix.display())), "{}", error.what);
+    assert_eq!(error.no_room(), None);
+
+    let error = executable(&Cache::new(), &Answers::new().var("SDKROOT", sdk.display().to_string()), "aarch64-apple-darwin")
+        .unwrap_err();
+    assert!(error.what.contains(DRIVER) && error.what.contains("neither CC_aarch64_apple_darwin nor CC"), "{}", error.what);
+}
+
+/// nix's libiconv re-exports libcharset by its absolute install name, which no `-L` names:
+/// ld64 loads it with libiconv, so the line has it after libiconv, needed when imported from.
+#[test]
+fn a_macos_library_is_followed_by_the_libraries_it_reexports() {
+    let sdk = temp("sdk-reexport");
+    touch(&sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#);
+    touch(&sdk.join("usr/lib/libSystem.tbd"), &stub("/usr/lib/libSystem.B.dylib", &[]));
+    touch(&sdk.join("usr/lib/libfake.1.tbd"), &stub("/usr/lib/libfake.1.dylib", &[]));
+    let (iconv, charset) = (temp("nix-iconv"), temp("nix-charset"));
+    let installed = charset.join("libcharset.1.dylib");
+    let installed = installed.to_str().unwrap();
+    let reexports = [installed, "/usr/lib/libfake.1.dylib"];
+    touch(&iconv.join("libiconv.dylib"), &stub(iconv.join("libiconv.2.dylib").to_str().unwrap(), &reexports));
+    touch(&charset.join("libcharset.1.dylib"), &stub(installed, &["@loader_path/deep/libdeep.dylib"]));
+    touch(&charset.join("deep/libdeep.dylib"), &stub("/nowhere/libdeep.dylib", &[installed]));
+    let answers = Answers::new().var("SDKROOT", sdk.display().to_string()).answer(DRIVER, jobs(&[&iconv]));
+    let cache = Cache::new();
+    let output = executable(&cache, &answers, "aarch64-apple-darwin").unwrap();
+    let located = locate_plain(&cache, &answers, &output, &[dylib("iconv")], &[]).unwrap();
+    let asked = NativeKind::Shared { as_needed: false };
+    assert_eq!(
+        line(&located),
+        [
+            (iconv.join("libiconv.dylib"), asked),
+            (charset.join("libcharset.1.dylib"), SHARED),
+            (charset.join("deep/libdeep.dylib"), SHARED),
+            (sdk.join("usr/lib/libfake.1.tbd"), SHARED),
+            (sdk.join("usr/lib/libSystem.tbd"), asked),
+        ],
+        "each re-export once, after its library, transitively; a `/usr/lib` one is the SDK's `.tbd`"
+    );
+    let search = std::slice::from_ref(&charset);
+    let located = locate_plain(&cache, &answers, &output, &[dylib("iconv"), dylib("charset.1")], search).unwrap();
+    assert_eq!(line(&located)[1], (charset.join("libcharset.1.dylib"), asked), "asked for too, it is loaded used or not");
+
+    touch(&iconv.join("libiconv.dylib"), &stub("/nix/libiconv.2.dylib", &["/gone/libcharset.1.dylib"]));
+    let error = locate_plain(&cache, &answers, &output, &[dylib("iconv")], &[]).unwrap_err();
+    assert!(error.what.contains("re-exports /gone/libcharset.1.dylib (LC_REEXPORT_DYLIB)"), "{}", error.what);
+    let found = error.not_found().expect("a typed not-found");
+    assert_eq!(found.library, "/gone/libcharset.1.dylib");
+    assert_eq!(found.files, ["libcharset.1.tbd", "libcharset.1.dylib"]);
+    assert_eq!(
+        found.searched,
+        [(sdk.join("gone"), Searched::Toolchain), (PathBuf::from("/gone"), Searched::InstallName)],
+        "under the SDK, then the install name's own directory"
+    );
+
+    touch(&iconv.join("libiconv.dylib"), &stub("/nix/libiconv.2.dylib", &["@rpath/libcharset.1.dylib"]));
+    let error = locate_plain(&cache, &answers, &output, &[dylib("iconv")], &[]).unwrap_err();
+    assert!(error.what.contains("@rpath/libcharset.1.dylib names the image's run"), "{}", error.what);
 }
 
 #[test]
@@ -525,10 +672,10 @@ fn a_windows_archive_is_followed_by_the_libraries_its_members_ask_for() {
     ];
     let located = locate_plain(&cache, &answers, &output, &libs, &[]).unwrap();
     assert_eq!(line(&located), expected, "each after the library that asked, each once, libcmt taken out by its asker");
-    let read = cache.asked.lock().unwrap().len();
+    let read = cache.asked.lock().len();
     assert_eq!(read, 3, "msvcrt.lib, vcruntime.lib and the empty archives' one content");
     assert_eq!(line(&locate_plain(&cache, &answers, &output, &libs, &[]).unwrap()), expected);
-    assert_eq!(cache.asked.lock().unwrap().len(), read, "an archive's content is read for its libraries once");
+    assert_eq!(cache.asked.lock().len(), read, "an archive's content is read for its libraries once");
 
     let mine = temp("mine-vc");
     touch(&mine.join("vcruntime.lib"), ARCHIVE);
@@ -640,7 +787,7 @@ fn autolinking(options: &[&[&'static str]]) -> Vec<u8> {
 fn a_macos_line_is_followed_by_what_its_objects_and_members_ask_for() {
     let (sdk, mine) = (temp("sdk-autolink"), temp("mine-autolink"));
     touch(&sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#);
-    let tbd = b"--- !tapi-tbd\ntbd-version: 4\n...\n";
+    let tbd = &stub("/usr/lib/libstub.dylib", &[]);
     touch(&sdk.join("usr/lib/libSystem.tbd"), tbd);
     touch(&sdk.join("usr/lib/libz.tbd"), tbd);
     let frameworks = sdk.join("System/Library/Frameworks");
@@ -649,7 +796,7 @@ fn a_macos_line_is_followed_by_what_its_objects_and_members_ask_for() {
     let sec = ar(&[("a.o", autolinking(&[&["-framework", "Security"]])), ("b.o", autolinking(&[&["-lhelper"]]))]);
     touch(&mine.join("libsec.a"), &sec);
     touch(&mine.join("libhelper.a"), &ar(&[("h.o", autolinking(&[&["-lz"], &["-framework", "Security"]]))]));
-    let answers = Answers::new().var("SDKROOT", sdk.display().to_string());
+    let answers = Answers::new().var("SDKROOT", sdk.display().to_string()).answer(DRIVER, jobs(&[]));
     let cache = Cache::new();
     let output = executable(&cache, &answers, "aarch64-apple-darwin").unwrap();
     let search = std::slice::from_ref(&mine);
@@ -665,10 +812,10 @@ fn a_macos_line_is_followed_by_what_its_objects_and_members_ask_for() {
     ];
     let located = locate_plain(&cache, &answers, &output, &libs, search).unwrap();
     assert_eq!(line(&located), expected, "an object's -lz, a member's -framework, transitively, each once after its asker");
-    let read = cache.asked.lock().unwrap().len();
-    assert_eq!(read, 3, "glue.o, libsec.a and libhelper.a");
+    let read = cache.asked.lock().len();
+    assert_eq!(read, 4, "glue.o, libsec.a and libhelper.a, and the stubs' re-exports");
     assert_eq!(line(&locate_plain(&cache, &answers, &output, &libs, search).unwrap()), expected);
-    assert_eq!(cache.asked.lock().unwrap().len(), read, "a file's content is read for its options once");
+    assert_eq!(cache.asked.lock().len(), read, "a file's content is read for its options once");
 
     touch(&mine.join("lost.o"), &autolinking(&[&["-lnowhere"]]));
     let error = locate_plain(&cache, &answers, &output, &[verbatim("lost.o")], search).unwrap_err();
@@ -741,13 +888,13 @@ fn a_linux_sanitizers_runtime_is_its_whole_archive_after_the_start_objects() {
 fn a_macos_sanitizers_runtime_is_its_dylib_found_by_an_absolute_rpath() {
     let sdk = temp("sanitize-sdk");
     touch(&sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#);
-    touch(&sdk.join("usr/lib/libSystem.tbd"), b"--- !tapi-tbd\ntbd-version: 4\n...\n");
-    let answers = Answers::new().var("SDKROOT", sdk.display().to_string());
+    touch(&sdk.join("usr/lib/libSystem.tbd"), &stub("/usr/lib/libSystem.B.dylib", &[]));
+    let answers = Answers::new().var("SDKROOT", sdk.display().to_string()).answer(DRIVER, jobs(&[]));
     let cache = Cache::new();
     let sysroot = temp("sanitize-macos");
     let dir = sysroot.join("lib/rustlib/aarch64-apple-darwin/lib");
     for name in ["asan", "tsan"] {
-        touch(&dir.join(format!("librustc-nightly_rt.{name}.dylib")), b"");
+        touch(&dir.join(format!("librustc-nightly_rt.{name}.dylib")), &stub("@rpath/librt.dylib", &[]));
     }
     let plain = executable(&cache, &answers, "aarch64-apple-darwin").unwrap();
     assert!(rpaths(Target::MacOs, &plain, &sysroot).unwrap().is_empty(), "no sanitizer, no rpath");

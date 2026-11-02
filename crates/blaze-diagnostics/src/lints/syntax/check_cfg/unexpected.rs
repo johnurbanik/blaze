@@ -18,12 +18,12 @@
 
 use std::ops::ControlFlow;
 
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::radix;
 use cfg::{CfgExpr, CfgOptions};
 use hir::{HirFileId, InFile, MacroCallId};
 use hir_expand::{MacroCallKind, MacroDefKind, builtin::BuiltinFnLikeExpander};
 use intern::Symbol;
-use rustc_hash::{FxHashMap, FxHashSet};
 use stdx::edit_distance::find_best_match_for_name;
 use syntax::{
     Edition, NodeOrToken, SyntaxKind, SyntaxNodePtr, TextRange,
@@ -60,9 +60,9 @@ const TARGET_NAMES: &[&str] = &[
 /// given, then the well-known ones, each with its values (`None`: any).
 struct Expected<'c> {
     names: Vec<&'c str>,
-    index: FxHashMap<&'c str, usize>,
+    index: HashMap<&'c str, usize>,
     values: Vec<Option<Set<'c>>>,
-    well_known: FxHashSet<&'static str>,
+    well_known: HashSet<&'static str>,
     exhaustive_names: bool,
 }
 
@@ -70,7 +70,7 @@ struct Expected<'c> {
 #[derive(Default)]
 struct Set<'c> {
     order: Vec<Option<&'c str>>,
-    has: FxHashSet<Option<&'c str>>,
+    has: HashSet<Option<&'c str>>,
 }
 
 impl<'c> Set<'c> {
@@ -90,7 +90,7 @@ impl<'c> Expected<'c> {
         let mut expected = Expected {
             // alloc: setup, once per check, the expected names
             names: Vec::new(),
-            index: FxHashMap::default(),
+            index: HashMap::default(),
             // alloc: setup, as above
             values: Vec::new(),
             // alloc: setup, as above
@@ -778,8 +778,8 @@ impl<'db> Lints<'_, '_, 'db> {
         match &loc.kind {
             MacroCallKind::FnLike { .. } => ast::MacroCall::cast(node)?.path().map(path),
             MacroCallKind::Derive { derive_index, .. } => {
-                let attr = ast::Attr::cast(node)?;
-                derive_paths_view(attr).into_iter().nth(*derive_index as usize).map(|(_, it)| it)
+                let meta = ast::Meta::cast(node)?;
+                derive_paths_view(meta).into_iter().nth(*derive_index as usize).map(|(_, it)| it)
             }
             MacroCallKind::Attr { ast_id, censored_attr_ids, .. } => {
                 censored_attr_ids.invoc_attr().find_attr_range_view(db, loc.krate, *ast_id).1.path().map(path)

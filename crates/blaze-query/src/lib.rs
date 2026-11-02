@@ -65,10 +65,7 @@ use std::{
 
 use blaze_core::{Completion, Done, Effect, FileName, Mapping, Tag};
 use blaze_format::{FormatError, Persist, SchemaHash, Writer};
-use blaze_graph::{
-    pump::Flights,
-    sched::fiber,
-};
+use blaze_graph::pump::Flights;
 use blaze_ids::{
     ContentId, Fingerprint, Hasher, Idx,
     bits::{AtomicBitSlice, BitSet, BitSlice, Bits},
@@ -586,17 +583,35 @@ static SPARE_STACKS: ShortLock<Vec<Box<Stacks>>> = ShortLock::new(Vec::new());
 /// call, which may resume it on another thread.
 pub use blaze_graph::sched::{Carried, carry};
 
+/// What is told of each query run, once it ran ([`on_each_run`]).
+static ON_RUN: OnceLock<fn()> = OnceLock::new();
+
+/// Has `hook` called on the running thread after each query's function runs (never on a hit
+/// or a verify): the daemon's stall watchdog counts it as work moving, since a long check can
+/// run for minutes inside queries with no span closing. Once per process; a second hook is
+/// refused and handed back.
+pub fn on_each_run(hook: fn()) -> Result<(), fn()> {
+    ON_RUN.set(hook)
+}
+
+#[inline]
+pub(crate) fn ran_one() {
+    if let Some(hook) = ON_RUN.get() {
+        hook();
+    }
+}
+
 /// Carries this engine's per-run thread-locals with each job on a fiber across its waits
-/// ([`fiber::carry`]): the query stacks (`db`'s and [`STACKS`]), [`INSIDE`] and
+/// ([`carry`]): the query stacks (`db`'s and [`STACKS`]), [`INSIDE`] and
 /// [`UNREADABLE`]. Once per process; every database's construction calls it, before a driver
 /// can run one of its queries.
 pub fn carry_with_fiber_jobs() {
     static CARRIED: std::sync::Once = std::sync::Once::new();
     CARRIED.call_once(|| {
-        fiber::carry(db::carried());
-        fiber::carry(fiber::Carried { take: take_stacks, put: put_stacks });
-        fiber::carry(fiber::Carried { take: take_inside, put: put_inside });
-        fiber::carry(fiber::Carried { take: take_unreadable, put: put_unreadable });
+        carry(db::carried());
+        carry(Carried { take: take_stacks, put: put_stacks });
+        carry(Carried { take: take_inside, put: put_inside });
+        carry(Carried { take: take_unreadable, put: put_unreadable });
     });
 }
 
@@ -1080,7 +1095,7 @@ enum Mark {
 /// A collection's marks, a bit a memo, in its frame.
 type Marks<'f> = Bits<Vec<u64, &'f blaze_mem::frame::Frame>, MemoId>;
 /// The input keys a collection keeps, in its frame.
-type KeptInputs<'f> = hashbrown::HashSet<QueryKey, rustc_hash::FxBuildHasher, &'f blaze_mem::frame::Frame>;
+type KeptInputs<'f> = hashbrown::HashSet<QueryKey, blaze_hash::FixedState, &'f blaze_mem::frame::Frame>;
 
 /// What the workers of a parallel mark share.
 struct Marking<'a> {
@@ -1741,7 +1756,7 @@ impl Database {
                 marks
             };
             let (mut reached, mut hot) = (marks(), marks());
-            let mut inputs_kept = hashbrown::HashSet::with_hasher_in(rustc_hash::FxBuildHasher, frame);
+            let mut inputs_kept = hashbrown::HashSet::with_hasher_in(blaze_hash::FixedState, frame);
             let mut work: Vec<MemoId, _> = Vec::new_in(frame);
             let mut views: Vec<&ViewState, _> = Vec::new_in(frame);
             self.views.for_each(&task, |state| {
@@ -1954,24 +1969,21 @@ impl Database {
             let mut stack: Vec<MemoId, _> = Vec::new_in(frame);
             let mut late: Vec<MemoId, _> = Vec::new_in(frame);
             let mut late_hot: Vec<MemoId, _> = Vec::new_in(frame);
-            let mut inputs: KeptInputs<'_> = hashbrown::HashSet::with_hasher_in(rustc_hash::FxBuildHasher, frame);
+            let mut inputs: KeptInputs<'_> = hashbrown::HashSet::with_hasher_in(blaze_hash::FixedState, frame);
             let reached = marking.reached;
-            let mut idle = 0u32;
+            let mut idle = blaze_graph::spin::SpinWait::new();
             loop {
                 if !marking.has_work() {
                     if marking.done() {
                         break;
                     }
                     marking.hungry.store(true, Relaxed);
-                    idle += 1;
-                    if idle < 64 {
-                        std::hint::spin_loop();
-                    } else {
+                    if !idle.spin() {
                         std::thread::yield_now();
                     }
                     continue;
                 }
-                idle = 0;
+                idle = blaze_graph::spin::SpinWait::new();
                 let busy = Busy::enter(&marking.busy);
                 marking.take(&task, &mut stack, &mut late_hot);
                 while let Some(memo) = stack.pop() {

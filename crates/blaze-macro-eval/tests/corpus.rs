@@ -64,7 +64,7 @@ fn expand() -> Result<Expanded, String> {
         .map(|it| format!("{:?}", it.kind))
         .collect();
     crate_def_map(db, panics);
-    let records = std::mem::take(&mut *records.lock().unwrap_or_else(|it| it.into_inner()));
+    let records = std::mem::take(&mut *records.lock());
     Ok(Expanded { records, calls, panics, diagnostics })
 }
 
@@ -133,6 +133,26 @@ const COVERED: &[(&str, &str, &str)] = &[
     ("corpus_state", "counter", "FIRST"),
     ("corpus_state", "counter", "SECOND"),
 ];
+
+/// The longest a serde derive of the corpus may take on the evaluator: past it, the
+/// evaluator is too slow for builds, whether or not the call ends within its steps.
+const SERDE_DERIVE_TIME: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// serde's derives on the corpus' plain struct and on its enum, each timed: what tells
+/// an evaluator that is slow from a macro that loops (which stops at its steps, naming them).
+#[test]
+#[ignore = "needs BLAZE_MACRO_CORPUS: the fixture workspace built by blaze"]
+fn a_serde_derive_takes_seconds_on_the_evaluator() {
+    let expanded = expanded();
+    for subject in ["Plain", "Shape"] {
+        for name in ["Serialize", "Deserialize"] {
+            let record = call_on("serde_derive", name, expanded.calls, subject);
+            output(record);
+            eprintln!("serde_derive::{name} on `{subject}`: {:?}", record.took);
+            assert!(record.took < SERDE_DERIVE_TIME, "{} took {:?}", record.what(), record.took);
+        }
+    }
+}
 
 #[test]
 #[ignore = "needs BLAZE_MACRO_CORPUS: the fixture workspace built by blaze"]

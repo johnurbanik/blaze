@@ -3,20 +3,19 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use base_db::{Db, Crate, CrateOrigin};
+use base_db::{Crate, CrateOrigin, Db};
 use blaze_codegen::{
-    CodegenError,
-    Owner,
+    CodegenError, Owner,
     backend::{Address, Described, DescribedStatic, FrontRef, Frontend},
     plan::{Mode, Origin, Package, PlanError, Policy},
 };
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemId, ItemKey};
+use blaze_query::db::FromId;
 use hir_def::{
-    AdtId, CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, GenericDefId, GenericParamId,
-    HasModule, Lookup,
-    attrs::AttrFlags,
-    expr_store::ExpressionStore,
+    AdtId, CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, GenericDefId,
+    GenericParamId, HasModule, Lookup, attrs::AttrFlags, expr_store::ExpressionStore,
     signatures::FunctionSignature,
 };
 use hir_ty::{
@@ -26,17 +25,17 @@ use hir_ty::{
 };
 use hir_ty_mir::mir::{MirOptions, overflow::crate_checks_overflow};
 use hir_ty_share::{BodyOptions, OptionsSet, ShareDef, ShareInstance, Unshared};
-use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::{
     BoundExistentialPredicates as _, GenericArgs as _, IntoKind, SliceLike as _,
 };
-use blaze_query::db::FromId;
 use smallvec::{SmallVec, smallvec};
 
-use super::{Body, BuildTime, HashSource, Hashes, HirInstance, HirStatic, Kind, build::Build, refs, undescribed};
+use super::{
+    Body, BuildTime, HashSource, Hashes, HirInstance, HirStatic, Kind, build::Build, refs,
+    undescribed,
+};
 use crate::{
-    Instance, InstanceDef, exported_static, exported_symbol, fncache, home::Homes,
-    linked_symbol,
+    Instance, InstanceDef, exported_static, exported_symbol, fncache, home::Homes, linked_symbol,
 };
 
 /// The build's database, `Sync` and shared by reference by every task. Nothing here locks:
@@ -92,7 +91,7 @@ struct ByOrigin<T> {
     dependency: T,
     build_time: T,
     /// Of a package the profile names (`[profile.*.package.<name>]`), the same three.
-    packages: FxHashMap<Package, [T; 3]>,
+    packages: HashMap<Package, [T; 3]>,
     std: T,
 }
 
@@ -104,7 +103,7 @@ impl<T> ByOrigin<T> {
         };
         // No package is named the empty name: these are of one the profile has nothing for.
         let [member, dependency, build_time] = kinds(Package::new(""));
-        let packages: FxHashMap<_, _> = (policy.profile.packages.keys())
+        let packages: HashMap<_, _> = (policy.profile.packages.keys())
             .filter(|it| *it != "*")
             .map(|name| {
                 let name = Package::new(name);
@@ -168,7 +167,7 @@ impl Units {
         });
         let any = inlines.values().any(|it| it == &Ok(true));
         let crates = base_db::all_crates(db);
-        let mut by_build: FxHashMap<Build, Asked> = FxHashMap::default();
+        let mut by_build: HashMap<Build, Asked> = HashMap::default();
         let options = builds.map(|it| -> Result<BodyOptions, String> {
             let builds = it.as_ref().map_err(ToString::to_string)?;
             let mut asked = Asked::default();
@@ -349,12 +348,12 @@ impl<'db> HirFrontend<'db> {
     ) -> Result<Described<HirInstance, HirStatic>, CodegenError> {
         let hashes = &self.hashes;
         let item = match &instance.0 {
-            Kind::Asm(text) => Ok(ItemKey(ContentId::of(ASM_ITEM_DOMAIN, text.as_bytes()))),
+            Kind::Asm(text, _) => Ok(ItemKey(ContentId::of(ASM_ITEM_DOMAIN, text.as_bytes()))),
             Kind::Allocator(forward) => Ok(super::allocator::item(forward)),
             kind => item_of(db, kind).and_then(|item| hashes.item(db, item)),
         }
-        .map_err(|what| undescribed(db, instance, None, what))?;
-        let fail = |what: String| undescribed(db, instance, Some(item), what);
+        .map_err(|what| undescribed(db, &super::Named(db, instance), None, what))?;
+        let fail = |what: String| undescribed(db, &super::Named(db, instance), Some(item), what);
         let code = code_of(db, hashes, &instance.0).map_err(fail)?;
         let generic = generic(&instance.0);
         let origin = match crate_of(db, &instance.0) {
@@ -373,7 +372,14 @@ impl<'db> HirFrontend<'db> {
         let overflow_checks = if generic { written_checks(db, &instance.0) } else { None };
         let symbol = symbol_of(db, &instance.0);
         let inlined = self.inlines_as(db, instance, Some(&origin)).map_err(fail)?;
-        let refs = refs::walk(db, instance, inlined, homes).map_err(fail)?;
+        let mut refs = refs::walk(db, instance, inlined, homes).map_err(fail)?;
+        if owner == Owner::Dependency {
+            for it in &mut refs {
+                if let FrontRef::Function(HirInstance(Kind::Asm(_, image))) = it {
+                    *image = true;
+                }
+            }
+        }
         // alloc: `Described::built_in` owns its list, which the memo's is borrowed from
         let built_in = refs::built_in(db, instance, inlined).map_err(fail)?.to_vec();
         Ok(Described {
@@ -463,7 +469,8 @@ impl<'db> HirFrontend<'db> {
             Kind::Code(instance, _) => instance,
             Kind::Start(main) if ours(main.krate(db)) => return Owner::Workspace,
             Kind::Start(_) => return Owner::Dependency,
-            Kind::Asm(_) => {
+            Kind::Asm(_, true) => return Owner::Dependency,
+            Kind::Asm(_, false) => {
                 return match requester {
                     Origin::Member(_) | Origin::BuildTime(_) => Owner::Workspace,
                     Origin::Dependency(_) | Origin::Std => Owner::Dependency,
@@ -565,7 +572,7 @@ fn body_of(db: &Db, instance: &HirInstance) -> Option<DefWithBodyId> {
             | InstanceDef::ReifyShim { .. } => None,
         },
         Kind::Start(main) => Some((*main).into()),
-        Kind::Asm(_) | Kind::Allocator(_) => None,
+        Kind::Asm(..) | Kind::Allocator(_) => None,
     }
 }
 
@@ -579,7 +586,7 @@ impl HirInstance {
         let instance = match &self.0 {
             Kind::Code(instance, _) => instance,
             Kind::Start(main) => return DefWithBodyId::from(*main) == body,
-            Kind::Asm(_) | Kind::Allocator(_) => return false,
+            Kind::Asm(..) | Kind::Allocator(_) => return false,
         };
         let is_body = |func: FunctionId| DefWithBodyId::from(func) == body;
         // A closure or coroutine whose body is `owner` is written in `body`, or in an
@@ -684,7 +691,7 @@ pub(crate) fn inlined<'a>(
     let mut found = Vec::new(); // alloc: the list returned, empty for nearly every instance
     // alloc: inline, eight on the stack
     let mut queue: SmallVec<[&HirInstance; 8]> = smallvec![instance];
-    let mut seen = FxHashSet::default();
+    let mut seen = HashSet::default();
     while let Some(at) = queue.pop() {
         let built_in = refs::built_in(db, at, inlined)?;
         if built_in.is_empty() {
@@ -740,7 +747,7 @@ pub(super) fn item_of(db: &Db, kind: &Kind) -> Result<ItemId, String> {
         Kind::Code(instance, env) => (instance, env),
         Kind::Start(main) => return Ok(ItemId::Function(*main)),
         // alloc: the error's message
-        Kind::Asm(_) => return Err("an `asm!` function, which is no item".to_owned()),
+        Kind::Asm(..) => return Err("an `asm!` function, which is no item".to_owned()),
         Kind::Allocator(_) => {
             // alloc: the error's message
             return Err("a function of the allocator shim, which is no item".to_owned());
@@ -801,7 +808,8 @@ fn per_instance(why: &Unshared) -> bool {
         | Unshared::NoContent(_)
         | Unshared::ConstEval(_)
         | Unshared::Unhashable(_)
-        | Unshared::Shape(_) => false,
+        | Unshared::Shape(_)
+        | Unshared::RecursionLimit { .. } => false,
     }
 }
 
@@ -825,7 +833,7 @@ fn share_def(def: InstanceDef) -> ShareDef {
 fn code_of(db: &Db, hashes: &HashSource, kind: &Kind) -> Result<CodeHash, String> {
     let (instance, env) = match kind {
         Kind::Code(instance, env) => (instance, env),
-        Kind::Asm(text) => return Ok(CodeHash(ContentId::of(ASM_DOMAIN, text.as_bytes()))),
+        Kind::Asm(text, _) => return Ok(CodeHash(ContentId::of(ASM_DOMAIN, text.as_bytes()))),
         Kind::Allocator(forward) => return Ok(super::allocator::code(forward)),
         Kind::Start(main) => {
             let mut hasher = Hasher::new(START_DOMAIN);
@@ -917,7 +925,7 @@ pub(super) fn crate_of(db: &Db, kind: &Kind) -> Option<Crate> {
             def => closure_loc(db, def).map(|loc| loc.owner.module(db).krate(db)),
         },
         Kind::Start(main) => Some(main.krate(db)),
-        Kind::Asm(_) | Kind::Allocator(_) => None,
+        Kind::Asm(..) | Kind::Allocator(_) => None,
     }
 }
 
@@ -971,7 +979,7 @@ fn identity(db: &Db, kind: &Kind, item: ItemKey, args: ContentId) -> ContentId {
             }
         },
         Kind::Start(_) => hasher.update(&[10]).id(&item.0),
-        Kind::Asm(_) => hasher.update(&[11]).id(&item.0),
+        Kind::Asm(..) => hasher.update(&[11]).id(&item.0),
         Kind::Allocator(forward) => hasher.update(&[12]).part(forward.symbol.as_bytes()),
     };
     hasher.id(&args);
@@ -985,7 +993,7 @@ fn identity(db: &Db, kind: &Kind, item: ItemKey, args: ContentId) -> ContentId {
 fn bound(db: &Db, kind: &Kind, code: CodeHash, args: ContentId) -> Result<ContentId, String> {
     let mut hasher = Hasher::new(INSTANCE_BOUND_DOMAIN);
     hasher.id(&code.0).id(&args);
-    if !matches!(kind, Kind::Asm(_) | Kind::Allocator(_)) {
+    if !matches!(kind, Kind::Asm(..) | Kind::Allocator(_)) {
         let item = item_of(db, kind)?;
         match blaze_items::bound_hash(db, item) {
             Ok(Some(it)) => hasher.update(&[1]).id(&it),
@@ -1032,7 +1040,7 @@ pub(super) fn symbol_of(db: &Db, kind: &Kind) -> Option<String> {
         Kind::Start(_) => Some(crate::Target::current().entry().0.to_owned()),
         // alloc: one of the shim's few entries, once per program
         Kind::Allocator(forward) => Some(forward.symbol.to_owned()),
-        Kind::Asm(_) => None,
+        Kind::Asm(..) => None,
     }
 }
 

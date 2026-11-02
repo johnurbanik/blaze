@@ -11,6 +11,8 @@
 //! term, it will be replaced with `quote!`. Do not add more usages to `from_text` -
 //! use `quote!` instead.
 
+#![expect(clippy::needless_pass_by_value, reason = "rust-analyzer's owned-node builder API; goes with the handles as format moves to views")]
+
 mod quote;
 
 use either::Either;

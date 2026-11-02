@@ -34,6 +34,33 @@ mod tests;
 mod unwind;
 
 pub(crate) use input::{Autolink, asked_libraries, autolink};
+
+/// The libraries the Mach-O dynamic library or `.tbd` stub `bytes` (`name` on the link line)
+/// re-exports from outside itself ([`crate::model::Shared::inputs`]), by install name: a
+/// dylib's `LC_REEXPORT_DYLIB`s, a stub's re-exports that are no document of it. ld64 loads
+/// each with the library, so the link line has them too ([`crate::target`]). A universal file
+/// is read for `arch`'s slice.
+pub(crate) fn reexported(name: &str, bytes: &[u8], arch: Arch, platform: u32) -> Result<Vec<String>, String> {
+    let cpu = match arch {
+        Arch::Aarch64 => macho::CPU_TYPE_ARM64,
+        Arch::X86_64 => macho::CPU_TYPE_X86_64,
+        // alloc: error path
+        Arch::Wasm32 => return Err(format!("{name}: a Mach-O library in a wasm32 link")),
+    };
+    let bytes = input::slice(name, bytes, cpu)?;
+    let magic = bytes.get(..4).map(|it| u32::from_le_bytes([it[0], it[1], it[2], it[3]]));
+    let shared = match magic == Some(macho::MH_MAGIC_64) {
+        true => dylib::read(name, bytes, arch)?,
+        false => {
+            let text = std::str::from_utf8(bytes).map_err(|_| {
+                // alloc: error path
+                format!("{name} is neither a Mach-O dynamic library nor a `.tbd` stub")
+            })?;
+            tbd::read(name, text, arch, platform)?
+        }
+    };
+    Ok(shared.inputs)
+}
 #[cfg(test)]
 pub(crate) use input::tests::linking as linking_object;
 #[cfg(feature = "fuzz")]
@@ -42,7 +69,6 @@ pub(crate) use dylib::trie_differential;
 pub(crate) use tbd::differential as tbd_differential;
 
 use std::cmp::Ordering;
-use std::sync::Mutex;
 
 use blaze_codegen::Arch;
 use blaze_format::cursor::Put;
@@ -50,6 +76,7 @@ use blaze_graph::par;
 use blaze_ids::radix;
 use blaze_sha256 as sha256;
 use object::macho;
+use parking_lot::Mutex;
 
 use crate::cow::CowBytes;
 use crate::model::{
@@ -58,6 +85,7 @@ use crate::model::{
 };
 use smallvec::SmallVec;
 use crate::output::Platform;
+use crate::reset::{self, Reset};
 use crate::{Format, LinkError, NativeKind, Output, OutputKind};
 
 /// Where an executable's image starts: after `__PAGEZERO`, which catches 32-bit pointers.
@@ -1606,7 +1634,7 @@ impl MachO {
         let base = placed.plan.base;
         let section_at = |addr: u64, what: &str| -> Result<u8, LinkError> { section_in(ranges, addr, what) };
 
-        let exported: rustc_hash::FxHashSet<&str> =
+        let exported: blaze_hash::HashSet<&str> =
             // alloc: one set per link, sized once by the exports
             placed.exports.iter().map(|it| it.name.as_str()).collect();
         let mut locals: Vec<(u64, &str)> = Vec::with_capacity(placed.functions.len());
@@ -2191,12 +2219,8 @@ fn written_since(placed: &Placed<'_>, kept: &Kept, debug_at: &[(u64, usize)]) ->
 
 /// The kept state, started over after a panic while it was held: a page may be without its
 /// hash, a table half patched.
-fn lock(cache: &Mutex<Kept>) -> std::sync::MutexGuard<'_, Kept> {
-    cache.lock().unwrap_or_else(|poisoned| {
-        let mut kept = poisoned.into_inner();
-        *kept = Kept::default();
-        kept
-    })
+fn lock(cache: &Mutex<Kept>) -> Reset<'_, Kept> {
+    reset::lock(cache)
 }
 
 /// A load command of a path at `at`, after `fields`: `LC_LOAD_DYLINKER`, `LC_*_DYLIB`.

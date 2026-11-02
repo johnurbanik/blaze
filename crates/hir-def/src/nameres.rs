@@ -75,7 +75,8 @@ use std::{
     ops::{Deref, DerefMut, Index, IndexMut},
 };
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
+use blaze_hash::HashMap;
 use blaze_mem::Tag;
 use either::Either;
 use hir_expand::{
@@ -84,7 +85,6 @@ use hir_expand::{
 };
 use intern::{Symbol, sym};
 use itertools::Itertools;
-use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use span::{Edition, FileAstId, FileId, ROOT_ERASED_FILE_AST_ID};
 use stdx::format_to;
@@ -107,8 +107,8 @@ use crate::{
     visibility::{Visibility, VisibilityExplicitness},
 };
 
-pub use self::path_resolution::ResolvePathResultPrefixInfo;
 pub use self::facts::impls::{ModuleImpls, module_impls};
+pub use self::path_resolution::ResolvePathResultPrefixInfo;
 
 #[cfg(test)]
 thread_local! {
@@ -200,7 +200,7 @@ impl std::hash::Hash for LocalDefMap {
 
 impl LocalDefMap {
     pub(crate) const EMPTY: &Self =
-        &Self { extern_prelude: FxIndexMap::with_hasher(rustc_hash::FxBuildHasher) };
+        &Self { extern_prelude: FxIndexMap::with_hasher(blaze_hash::FixedState) };
 
     fn shrink_to_fit(&mut self) {
         let Self { extern_prelude } = self;
@@ -243,7 +243,7 @@ pub struct DefMap {
     /// `macro_use` prelude that contains macros from `#[macro_use]`'d external crates. Note that
     /// this contains all kinds of macro, not just `macro_rules!` macro.
     /// ExternCrateId being None implies it being imported from the general prelude import.
-    macro_use_prelude: FxHashMap<Name, (MacroId, Option<ExternCrateId>)>,
+    macro_use_prelude: HashMap<Name, (MacroId, Option<ExternCrateId>)>,
 
     /// Tracks which custom derives are in scope for an item, to allow resolution of derive helper
     /// attributes.
@@ -271,7 +271,7 @@ pub struct DefMap {
 }
 
 type DeriveHelpers =
-    FxHashMap<AstId<ast::Item>, Vec<(Name, MacroId, Either<MacroCallId, BuiltinDeriveImplId>)>>;
+    HashMap<AstId<ast::Item>, Vec<(Name, MacroId, Either<MacroCallId, BuiltinDeriveImplId>)>>;
 
 /// What a collected def map recorded that no resolution reads: how its imports and macro calls
 /// resolved, its diagnostics and the derive helpers in scope of its items.
@@ -349,9 +349,9 @@ impl DiagnosticsByModule {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DefMapCrateData {
     /// Side table for resolving derive helpers.
-    exported_derives: FxHashMap<MacroId, Box<[Name]>>,
-    fn_proc_macro_mapping: FxHashMap<FunctionId, ProcMacroId>,
-    fn_proc_macro_mapping_back: FxHashMap<ProcMacroId, FunctionId>,
+    exported_derives: HashMap<MacroId, Box<[Name]>>,
+    fn_proc_macro_mapping: HashMap<FunctionId, ProcMacroId>,
+    fn_proc_macro_mapping_back: HashMap<ProcMacroId, FunctionId>,
 
     /// Custom tool modules registered with `#![register_tool]`.
     registered_tools: Vec<Symbol>,
@@ -371,9 +371,9 @@ struct DefMapCrateData {
 impl DefMapCrateData {
     fn new(edition: Edition) -> Self {
         Self {
-            exported_derives: FxHashMap::default(),
-            fn_proc_macro_mapping: FxHashMap::default(),
-            fn_proc_macro_mapping_back: FxHashMap::default(),
+            exported_derives: HashMap::default(),
+            fn_proc_macro_mapping: HashMap::default(),
+            fn_proc_macro_mapping_back: HashMap::default(),
             // alloc: once per crate
             registered_tools: PREDEFINED_TOOLS.iter().map(|it| Symbol::intern(it)).collect(),
             unstable_features: UnstableFeatures::default(),
@@ -768,6 +768,66 @@ impl std::fmt::Display for Unmaintained {
 
 impl std::error::Error for Unmaintained {}
 
+/// Name resolution of a crate, or of a block of it, that still made progress after
+/// `FIXED_POINT_LIMIT` macro rounds: every round resolved a macro call or reseeded an
+/// attribute, so it would never reach its fixed point. A bug in blaze, or a program whose
+/// macros expand without end below the recursion limit. It unwinds like [`Unmaintained`], and
+/// the driver that catches it stops the build with it as the error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixpointLimit {
+    pub krate: Crate,
+    /// Its display name, if it has one.
+    pub name: Option<String>,
+    /// Whether it was a block's resolution, not the crate's.
+    pub block: bool,
+    /// The rounds run.
+    pub rounds: u32,
+    /// How many macro calls were still waiting to resolve, and how many imports.
+    pub pending_macros: usize,
+    pub pending_imports: usize,
+    /// The first of them, each as "macro `path` in module `name`" or "import `path` in ...".
+    pub first: Vec<String>,
+}
+
+impl FixpointLimit {
+    /// How many of the pending macro calls and imports [`FixpointLimit::first`] lists.
+    pub(crate) const LISTED: usize = 8;
+
+    /// Unwinds with `self` as the payload, logged first as [`Unmaintained::throw`] is.
+    pub fn throw(self) -> ! {
+        tracing::error!("{self}");
+        std::panic::panic_any(self)
+    }
+
+    /// The `FixpointLimit` a caught panic's payload is, if it is one.
+    // dyn: a caught panic's payload, read once
+    pub fn of_payload(payload: &(dyn std::any::Any + Send)) -> Option<&FixpointLimit> {
+        payload.downcast_ref::<FixpointLimit>()
+    }
+}
+
+impl std::fmt::Display for FixpointLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("name resolution: ")?;
+        if self.block {
+            f.write_str("a block of ")?;
+        }
+        f.write_str("crate ")?;
+        write_crate(f, self.krate, self.name.as_deref())?;
+        write!(
+            f,
+            " still made progress after {} macro rounds, with {} macro calls and {} imports pending",
+            self.rounds, self.pending_macros, self.pending_imports
+        )?;
+        for it in &self.first {
+            write!(f, "\n  {it}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for FixpointLimit {}
+
 #[blaze_query::tracked(returns(ref))]
 pub fn block_def_map<'db>(db: &'db Db, block_id: BlockIdLt<'db>) -> DefMap {
     // The `'static` ids go only into the `DefMap` this query returns, invalidated with its key.
@@ -831,8 +891,8 @@ impl DefMap {
             modules: ModulesSlot::Building(modules),
             krate,
             prelude: None,
-            macro_use_prelude: FxHashMap::default(),
-            derive_helpers_in_scope: FxHashMap::default(),
+            macro_use_prelude: HashMap::default(),
+            derive_helpers_in_scope: HashMap::default(),
             session_macros: false,
             names: uses::NameRecords::default(),
             // alloc: empty; allocates nothing until a diagnostic
@@ -1189,7 +1249,7 @@ impl DefMap {
         self.prelude
     }
 
-    pub(crate) fn macro_use_prelude(&self) -> &FxHashMap<Name, (MacroId, Option<ExternCrateId>)> {
+    pub(crate) fn macro_use_prelude(&self) -> &HashMap<Name, (MacroId, Option<ExternCrateId>)> {
         &self.macro_use_prelude
     }
 
@@ -1632,7 +1692,7 @@ fn sub_namespace_match(
     }
 }
 
-/// A newtype wrapper around `FxHashMap<ModuleId, ModuleData>` that implements `IndexMut`.
+/// A newtype wrapper around `HashMap<ModuleId, ModuleData>` that implements `IndexMut`.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ModulesMap {
     inner: FxIndexMap<ModuleId, ModuleData>,

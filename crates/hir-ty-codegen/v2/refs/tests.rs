@@ -11,12 +11,12 @@ use blaze_codegen::{
     backend::FrontRef,
     settings::{DebugInfo, Panic, Relocation, Sanitize, Spec, Toolchain},
 };
+use blaze_hash::HashSet;
 use blaze_ids::ContentId;
 use cranelift_codegen::ir;
 use hir_def::{FunctionId, StaticId, signatures::FunctionSignature};
-use hir_ty::db::HirDatabase;
-use rustc_hash::FxHashSet;
 use hir_expand::fixture;
+use hir_ty::db::HirDatabase;
 
 use super::walk;
 use crate::{
@@ -25,8 +25,8 @@ use crate::{
     v2::{
         BuildTime, Built, Databases, HashSource, HirFrontend, HirInstance, HirStatic, Kind,
         backend::{built, compiled_in},
-        by_id::ById,
         build::{self, Build},
+        by_id::ById,
         places::{self, Placer, Ref, place_requests},
     },
 };
@@ -114,7 +114,7 @@ fn walked(
         .with(|db, homes| walk(db, instance, false, homes))
         .unwrap_or_else(|e| panic!("in another database: {e}"));
     assert_eq!(first, elsewhere, "{instance:?} walks otherwise in another database");
-    let distinct: FxHashSet<&Ref> = first.iter().collect();
+    let distinct: HashSet<&Ref> = first.iter().collect();
     assert_eq!(distinct.len(), first.len(), "{instance:?} lists a reference twice: {first:?}");
     first
 }
@@ -152,7 +152,7 @@ fn placed(
 fn reach(frontend: &HirFrontend, root: HirInstance) -> Reached {
     let specs = specs();
     frontend.with(|db, homes| {
-        let mut seen = FxHashSet::default();
+        let mut seen = HashSet::default();
         seen.insert(root.clone());
         let mut queue = vec![root];
         let mut reached = Reached::new();
@@ -169,7 +169,7 @@ fn reach(frontend: &HirFrontend, root: HirInstance) -> Reached {
                             queue.push(next.clone());
                         }
                     }
-                    Kind::Asm(_) => assert_eq!(walk(db, next, false, homes), Ok(Vec::new())),
+                    Kind::Asm(..) => assert_eq!(walk(db, next, false, homes), Ok(Vec::new())),
                     Kind::Start(_) | Kind::Allocator(_) => (),
                 }
             }
@@ -595,7 +595,7 @@ fn extern_and_variadic_calls_list_their_symbols() {
     let assembly: Vec<&HirInstance> = walked
         .iter()
         .filter_map(|it| match it {
-            FrontRef::Function(instance @ HirInstance(Kind::Asm(_))) => Some(instance),
+            FrontRef::Function(instance @ HirInstance(Kind::Asm(..))) => Some(instance),
             _ => None,
         })
         .collect();
@@ -710,7 +710,7 @@ fn a_constant_lists_the_functions_it_points_at() {
 #[test]
 fn assembly_walks_empty() {
     let (_, frontend) = frontend(PLAIN);
-    let assembly = HirInstance(Kind::Asm("nop".to_owned()));
+    let assembly = HirInstance(Kind::Asm("nop".to_owned(), false));
     frontend.with(|db, homes| assert_eq!(walk(db, &assembly, false, homes), Ok(Vec::new())));
 }
 

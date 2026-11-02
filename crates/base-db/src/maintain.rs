@@ -24,13 +24,14 @@
 use std::{
     any::{Any, TypeId},
     panic::{self, AssertUnwindSafe},
-    sync::{Mutex, MutexGuard, OnceLock, PoisonError},
+    sync::OnceLock,
 };
 
 use blaze_dbsp::Work;
+use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use blaze_mem::{Tag, frame};
-use rustc_hash::FxHashMap;
+use parking_lot::{Mutex, MutexGuard};
 use smallvec::SmallVec;
 use span::FileId;
 
@@ -49,8 +50,10 @@ pub struct Written<'a> {
     pub removed: &'a [FileId],
     /// Source roots whose file sets changed (a `mod` probe may now hit).
     pub roots: &'a [SourceRootId],
-    /// The crate graph, cfg, env or proc macros changed.
+    /// The crate graph, cfg or env changed, or proc macros set by [`Db::note_crates_changed`].
     pub crates: bool,
+    /// Crates given proc macros in place of those they had ([`Db::note_proc_macros`]).
+    pub proc_macros: &'a [Crate],
     /// Files `include_bytes!` or `include_str!` read whose bytes changed.
     pub included: &'a [IncludedFile],
 }
@@ -62,6 +65,7 @@ impl Written<'_> {
             && self.removed.is_empty()
             && self.roots.is_empty()
             && !self.crates
+            && self.proc_macros.is_empty()
             && self.included.is_empty()
     }
 }
@@ -201,7 +205,7 @@ impl<K: Send + 'static> Batch for Each<K> {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    mutex.lock()
 }
 
 inventory::collect!(Maintainer);
@@ -241,7 +245,7 @@ pub fn maintainers() -> &'static [&'static Maintainer] {
 pub(crate) struct Maintenance {
     /// Behind a lock so a maintainer's reads, on `&Db`, can have it lent ([`Db::lend_state`]).
     // dyn: write-side state, one lookup per maintainer per write
-    state: Mutex<FxHashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+    state: Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
     /// Whether a maintainer's reads are running: only they are lent state on `&Db`.
     reading: bool,
     pending: Pending,
@@ -264,6 +268,7 @@ struct Pending {
     removed: Vec<FileId>,
     roots: Vec<SourceRootId>,
     crates: bool,
+    proc_macros: Vec<Crate>,
     included: Vec<IncludedFile>,
 }
 
@@ -279,6 +284,7 @@ impl Default for Pending {
             removed: Vec::with_capacity(PENDING_ROOM),
             roots: Vec::with_capacity(PENDING_ROOM),
             crates: false,
+            proc_macros: Vec::new(), // alloc: grows to the proc-macro crates, kept from one pass to the next
             included: Vec::with_capacity(PENDING_ROOM),
         }
     }
@@ -294,6 +300,7 @@ impl Pending {
             removed: Vec::new(), // alloc: see above
             roots: Vec::new(), // alloc: see above
             crates: false,
+            proc_macros: Vec::new(), // alloc: see above
             included: Vec::new(), // alloc: see above
         }
     }
@@ -309,6 +316,7 @@ impl Pending {
             removed: &self.removed,
             roots: &self.roots,
             crates: self.crates,
+            proc_macros: &self.proc_macros,
             included: &self.included,
         }
     }
@@ -321,6 +329,8 @@ impl Pending {
         }
         self.roots.sort_unstable();
         self.roots.dedup();
+        self.proc_macros.sort_unstable();
+        self.proc_macros.dedup();
         let (added, removed) = (&self.added, &self.removed);
         self.set.retain(|file| {
             added.binary_search(file).is_err() && removed.binary_search(file).is_err()
@@ -333,6 +343,7 @@ impl Pending {
         self.removed.clear();
         self.roots.clear();
         self.crates = false;
+        self.proc_macros.clear();
         self.included.clear();
     }
 }
@@ -343,6 +354,7 @@ pub(crate) enum Note<'a> {
     View { set: &'a [FileId], added: &'a [FileId], removed: &'a [FileId], roots: &'a [SourceRootId] },
     Root(SourceRootId),
     Crates,
+    ProcMacros(Crate),
     Included(IncludedFile),
 }
 
@@ -359,9 +371,9 @@ impl Db {
         &mut self,
         f: impl FnOnce(&mut Db, &mut T) -> R,
     ) -> R {
-        let mut state = take_state::<T>(self.maintenance.state.get_mut().unwrap_or_else(PoisonError::into_inner));
+        let mut state = take_state::<T>(self.maintenance.state.get_mut());
         let ran = panic::catch_unwind(AssertUnwindSafe(|| f(self, &mut *state)));
-        put_state(self.maintenance.state.get_mut().unwrap_or_else(PoisonError::into_inner), state, ran)
+        put_state(self.maintenance.state.get_mut(), state, ran)
     }
 
     /// [`Db::with_state`] for a maintainer's reads, which have the database by `&`: `f` gets the
@@ -404,6 +416,14 @@ impl Db {
     /// crate's proc macros), as a write: outside a [`Db::batch`] the maintainers run now.
     pub fn note_crates_changed(&mut self) {
         self.batch(|db| db.note(Note::Crates));
+    }
+
+    /// Notes that `krate` was given proc macros in place of those it had, as a write: outside a
+    /// [`Db::batch`] the maintainers run now. Unlike [`Db::note_crates_changed`] it leaves the
+    /// other crates' maintained state warm: a crate's list reaches only its own def map, and
+    /// the crates depending on it through that.
+    pub fn note_proc_macros(&mut self, krate: Crate) {
+        self.batch(|db| db.note(Note::ProcMacros(krate)));
     }
 
     /// Records what `maintainer` did for `krate` in this pass, while [`Db::keep_maintained`] is
@@ -450,6 +470,7 @@ impl Db {
             }
             Note::Root(root) => pending.roots.push(root),
             Note::Crates => pending.crates = true,
+            Note::ProcMacros(krate) => pending.proc_macros.push(krate),
             Note::Included(file) => {
                 if !pending.included.contains(&file) {
                     pending.included.push(file);
@@ -579,7 +600,7 @@ impl Db {
     /// Drops every maintainer's state, so the next write maintains from empty, and has it
     /// re-check everything.
     fn forget_maintained_state(&mut self) {
-        self.maintenance.state.get_mut().unwrap_or_else(PoisonError::into_inner).clear();
+        self.maintenance.state.get_mut().clear();
         self.maintenance.pending.crates = true;
     }
 }
@@ -591,7 +612,7 @@ struct InUse;
 /// marked out.
 fn take_state<T: Default + Send + Sync + 'static>(
     // dyn: write-side state, one lookup per maintainer per write
-    states: &mut FxHashMap<TypeId, Box<dyn Any + Send + Sync>>,
+    states: &mut HashMap<TypeId, Box<dyn Any + Send + Sync>>,
 ) -> Box<T> {
     let id = TypeId::of::<T>();
     match states.get_mut(&id) {
@@ -618,7 +639,7 @@ fn take_state<T: Default + Send + Sync + 'static>(
 /// goes on with the call's result or its panic.
 fn put_state<T: Send + Sync + 'static, R>(
     // dyn: write-side state, one lookup per maintainer per write
-    states: &mut FxHashMap<TypeId, Box<dyn Any + Send + Sync>>,
+    states: &mut HashMap<TypeId, Box<dyn Any + Send + Sync>>,
     state: Box<T>,
     ran: std::thread::Result<R>,
 ) -> R {

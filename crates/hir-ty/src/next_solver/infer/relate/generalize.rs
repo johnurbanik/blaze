@@ -4,7 +4,7 @@ use std::hash::Hash;
 use std::mem;
 
 use arrayvec::ArrayVec;
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use rustc_type_ir::error::TypeError;
 use rustc_type_ir::inherent::{IntoKind, Term as _, Ty as _};
 use rustc_type_ir::relate::VarianceDiagInfo;
@@ -347,12 +347,12 @@ const CACHE_INLINE: usize = 8;
 /// first `CACHE_INLINE` entries live in place and nothing is allocated unless it spills.
 pub(in crate::next_solver::infer) struct GeneralizeCache<K, V> {
     inline: ArrayVec<(K, V), CACHE_INLINE>,
-    spill: FxHashMap<K, V>,
+    spill: HashMap<K, V>,
 }
 
 impl<K, V> Default for GeneralizeCache<K, V> {
     fn default() -> Self {
-        GeneralizeCache { inline: ArrayVec::new(), spill: FxHashMap::default() }
+        GeneralizeCache { inline: ArrayVec::new(), spill: HashMap::default() }
     }
 }
 
@@ -556,9 +556,15 @@ impl<'db> TypeRelation<DbInterner<'db>> for Generalizer<'_, 'db> {
                                 | Variance::Contravariant => (),
                             }
 
+                            // rustc's `var_origin`: the new variable stands for the same
+                            // parameter, which "cannot infer type of `T`" names.
                             let origin = inner.type_variables().var_span(vid);
-                            let new_var_id =
-                                inner.type_variables().new_var(self.for_universe, origin);
+                            let param = inner.type_variable_storage.param(vid);
+                            let new_var_id = inner.type_variables().new_var_for_param(
+                                self.for_universe,
+                                origin,
+                                param,
+                            );
                             // Record that `vid` and `new_var_id` have to be subtypes
                             // of each other. This is currently only used for diagnostics.
                             // To see why, see the docs in the `type_variables` module.
@@ -694,6 +700,12 @@ impl<'db> TypeRelation<DbInterner<'db>> for Generalizer<'_, 'db> {
                             // for more details.
                             if !self.infcx.typing_mode_raw().is_coherence() && self.in_alias {
                                 variable_table.union(vid, new_var_id);
+                            }
+                            // rustc's origin, copied: the parameter `vid` was made for.
+                            let params = &inner.const_var_params;
+                            if let Ok(at) = params.binary_search_by_key(&vid, |&(vid, _)| vid) {
+                                let param = params[at].1;
+                                inner.const_var_params.push((new_var_id, param));
                             }
                             Ok(Const::new_var(self.cx(), new_var_id))
                         }

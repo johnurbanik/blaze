@@ -3,6 +3,7 @@
 //! fields, etc.
 
 use base_db::Db;
+use blaze_hash::HashSet;
 use either::Either;
 use hir_def::{
     AdtId, AssocItemId, CallableDefId, DefWithBodyId, EnumVariantId, HasModule, ItemContainerId,
@@ -13,7 +14,6 @@ use hir_def::{
     resolver::{ValueNs, resolver_for_scope},
 };
 use intern::sym;
-use rustc_hash::FxHashSet;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
 use syntax::{AstNode, ast};
 
@@ -173,17 +173,16 @@ impl<'db> ExprValidator<'db> {
         }
     }
 
+    /// `unused_must_use` is rustc's lint, warned by default: it runs whatever
+    /// `validate_lints` (rust-analyzer's own style lints) says.
     fn validate_block(&mut self, statements: Statements<'_>) {
-        if !self.validate_lints {
-            return;
-        }
+        let mut diags = std::mem::take(&mut self.diagnostics);
         for stmt in statements {
             if let Statement::Expr { expr: stmt_expr, has_semi: true } = stmt {
-                let mut diags = Vec::new();
                 self.check_unused_must_use(stmt_expr, &mut diags);
-                self.diagnostics.extend(diags);
             }
         }
+        self.diagnostics = diags;
     }
 
     fn check_unused_must_use(
@@ -439,7 +438,7 @@ pub fn record_literal_missing_fields<'db>(
 
     let variant_data = variant_def.fields(db);
 
-    let specified_fields: FxHashSet<_> = fields.iter().map(|f| &f.name).collect();
+    let specified_fields: HashSet<_> = fields.iter().map(|f| &f.name).collect();
     // don't show missing fields if:
     // - has ..expr
     // - or has default value + ..
@@ -493,7 +492,7 @@ pub fn record_pattern_missing_fields<'db>(
 
     let variant_data = variant_def.fields(db);
 
-    let specified_fields: FxHashSet<_> = fields.iter().map(|f| &f.name).collect();
+    let specified_fields: HashSet<_> = fields.iter().map(|f| &f.name).collect();
     // don't show missing fields if:
     // - in code
     // - or has ..

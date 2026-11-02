@@ -4,11 +4,13 @@
 use std::{
     any::Any,
     fmt,
-    sync::{Arc, Mutex},
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use base_db::{ContentId, Crate, Db, Env};
 use hir_expand::proc_macro::{ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind};
+use parking_lot::Mutex;
 use span::Span;
 use tt::TopSubtree;
 
@@ -100,6 +102,8 @@ pub(crate) fn literals(tree: &TopSubtree) -> Vec<String> {
 pub(crate) struct Record {
     pub(crate) call: Call,
     pub(crate) eval: Outcome,
+    /// How long blaze-macro-eval took to give it, the wall clock's.
+    pub(crate) took: Duration,
 }
 
 impl Record {
@@ -125,6 +129,9 @@ pub(crate) struct Recorder {
     records: Records,
 }
 
+/// A call that panicked records nothing: the records kept are each whole.
+impl std::panic::RefUnwindSafe for Recorder {}
+
 impl Recorder {
     /// `eval`, of crate `krate`, recording into `records`.
     pub(crate) fn wrap(krate: &str, eval: ProcMacro, records: &Records) -> ProcMacro {
@@ -140,10 +147,12 @@ impl Recorder {
     }
 
     fn run(&self, db: &Db, calling: Option<Crate>, call: ProcMacroCall<'_>) -> Result<TopSubtree, ProcMacroExpansionError> {
+        let start = Instant::now();
         let expanded = match calling {
             Some(krate) => self.eval.expand_in(db, krate, call),
             None => self.eval.expand(db, call),
         };
+        let took = start.elapsed();
         let eval = Outcome::of(&expanded);
         let recorded = Call {
             krate: self.krate.clone(),
@@ -158,7 +167,7 @@ impl Recorder {
             mixed_site: call.mixed_site,
             current_dir: call.current_dir.to_owned(),
         };
-        self.records.lock().unwrap_or_else(|it| it.into_inner()).push(Record { call: recorded, eval });
+        self.records.lock().push(Record { call: recorded, eval, took });
         expanded
     }
 }

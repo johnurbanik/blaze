@@ -20,6 +20,7 @@ use std::borrow::Cow;
 use std::fmt::{self, Write as _};
 
 use blaze_bytes::le::{get_u16 as u16_at, get_u32 as u32_at, get_u64 as u64_at};
+use blaze_codegen::RawImport;
 use blaze_core::decimal::decimal;
 use blaze_graph::par;
 use blaze_hash::HashMap;
@@ -250,6 +251,56 @@ fn short_import<'d>(name: Input<'_>, data: &'d [u8]) -> Result<(Cow<'d, str>, Im
     };
     let version = export.version();
     Ok((dll, Imported { name: symbol, version, kind }))
+}
+
+/// An import library of `imports`, as `lib /def` would make: an archive with one short import
+/// member each, read back with [`NativeKind::Shared`]. It has no symbol index, which only an
+/// archive of members taken one at a time needs.
+pub(crate) fn import_library_of(imports: &[RawImport]) -> Vec<u8> {
+    const MAGIC: &[u8] = b"!<arch>\n";
+    const IMPORT_HEADER: usize = 20;
+    let member = |it: &RawImport| {
+        IMPORT_HEADER + it.symbol.len() + it.dll.len() + 2 + it.export.as_ref().map_or(0, |it| it.len() + 1)
+    };
+    let total = imports.iter().map(|it| MEMBER_HEADER as usize + (member(it) + 1) / 2 * 2).sum::<usize>();
+    let mut out = Vec::with_capacity(MAGIC.len() + total); // alloc: once per link with raw imports
+    out.extend_from_slice(MAGIC);
+    for it in imports {
+        let size = member(it);
+        // Name, date, user, group and mode, the size, and the end of an archive member's header.
+        let mut header = [b' '; MEMBER_HEADER as usize];
+        header[..7].copy_from_slice(b"import/");
+        header[16] = b'0';
+        header[40] = b'0';
+        let mut digits = [0; 20];
+        let digits = decimal(size as u64, &mut digits).as_bytes();
+        header[48..48 + digits.len()].copy_from_slice(digits);
+        header[58..].copy_from_slice(b"`\n");
+        out.extend_from_slice(&header);
+        let kind = if it.data { pe::IMPORT_OBJECT_DATA } else { pe::IMPORT_OBJECT_CODE };
+        let name = if it.export.is_some() { pe::IMPORT_OBJECT_NAME_EXPORTAS } else { pe::IMPORT_OBJECT_NAME };
+        let flags = kind.0 | name.0 << pe::IMPORT_OBJECT_NAME_SHIFT;
+        out.extend_from_slice(&pe::IMAGE_FILE_MACHINE_UNKNOWN.0.to_le_bytes());
+        out.extend_from_slice(&0xffff_u16.to_le_bytes());
+        out.extend_from_slice(&0_u16.to_le_bytes());
+        out.extend_from_slice(&pe::IMAGE_FILE_MACHINE_AMD64.0.to_le_bytes());
+        out.extend_from_slice(&0_u32.to_le_bytes());
+        out.extend_from_slice(&((size - IMPORT_HEADER) as u32).to_le_bytes());
+        out.extend_from_slice(&0_u16.to_le_bytes());
+        out.extend_from_slice(&flags.to_le_bytes());
+        out.extend_from_slice(it.symbol.as_bytes());
+        out.push(0);
+        out.extend_from_slice(it.dll.as_bytes());
+        out.push(0);
+        if let Some(export) = &it.export {
+            out.extend_from_slice(export.as_bytes());
+            out.push(0);
+        }
+        if size % 2 == 1 {
+            out.push(b'\n');
+        }
+    }
+    out
 }
 
 /// How the writer names an import in the DLL's export table, as `SharedSymbol::version` and

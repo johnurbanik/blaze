@@ -1569,6 +1569,33 @@ fn import_library_is_a_shared_per_dll() {
     assert!(error.contains("import library"), "{error}");
 }
 
+/// What a program's `raw-dylib` blocks import, made into a library, reads back as any other
+/// import library: one `Shared` per DLL, a member of odd length padded.
+#[test]
+fn an_import_library_made_reads_back() {
+    use blaze_codegen::RawImport;
+    let import = |dll: &str, symbol: &str, data| RawImport { dll: dll.to_owned(), symbol: symbol.to_owned(), export: None, data };
+    let bytes = super::import_library_of(&[
+        import("KERNEL32.dll", "Sleep", false),
+        import("USER32.dll", "Odd", true),
+        import("KERNEL32.dll", "ExitProcess", false),
+        RawImport::of_marked(&RawImport::marked("KERNEL32.dll", "GetTickCount")).unwrap(),
+    ]);
+    let pe = pe(exe());
+    let NativeFile::Shared(shared) = pe.read("x.lib", &bytes, &NativeKind::Shared { as_needed: true }).unwrap() else {
+        panic!("not read as an import library")
+    };
+    assert_eq!(shared.name, "KERNEL32.dll");
+    let names: Vec<&str> = shared.symbols.iter().map(|it| shared.symbol_name(it)).collect();
+    assert_eq!(names, ["Sleep", "ExitProcess", "__blaze_raw$KERNEL32.dll$GetTickCount"]);
+    let versions: Vec<Option<&str>> = shared.symbols.iter().map(|it| shared.version(it)).collect();
+    assert_eq!(versions, [Some("0 Sleep"), Some("0 ExitProcess"), Some("0 GetTickCount")]);
+    assert_eq!(shared.more.len(), 1);
+    assert_eq!(shared.more[0].name, "USER32.dll");
+    assert_eq!(shared.more[0].symbol_name(&shared.more[0].symbols[0]), "Odd");
+    assert!(matches!(shared.more[0].symbols[0].kind, SymbolKind::Data));
+}
+
 /// Grouped on every thread, an import library reads as one pass over its members would: the
 /// DLLs in the order each is first met, each DLL's imports in member order, and the first
 /// failing member's error.

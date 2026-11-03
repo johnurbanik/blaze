@@ -54,11 +54,12 @@ fn an_image_is_put_once_for_the_loop_and_other_bytes_under_its_key_are_an_error(
 }
 
 #[test]
-fn blaze_dep_images_is_check_verify_or_unset() {
+fn blaze_dep_images_is_serve_check_verify_or_unset() {
     let env = |value: &str| vec![("PATH".to_owned(), "/bin".to_owned()), (IMAGES.to_owned(), value.to_owned())];
-    assert_eq!(mode_in(&[]).unwrap(), Mode::Serve);
-    assert_eq!(mode_in(&env("check")).unwrap(), Mode::Check);
-    assert_eq!(mode_in(&env("verify")).unwrap(), Mode::Verify);
+    assert_eq!(mode_in(&[]).unwrap(), None);
+    assert_eq!(mode_in(&env("serve")).unwrap(), Some(Mode::Serve));
+    assert_eq!(mode_in(&env("check")).unwrap(), Some(Mode::Check));
+    assert_eq!(mode_in(&env("verify")).unwrap(), Some(Mode::Verify));
     let error = mode_in(&env("off")).unwrap_err();
     assert!(error.what.starts_with("BLAZE_DEP_IMAGES=off is not a value blaze takes"), "{}", error.what);
 }

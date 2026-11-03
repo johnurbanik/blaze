@@ -825,6 +825,8 @@ fn link_at(
     let built = generated.built;
     let debug = match generated.policy.profile.debuginfo {
         DebugInfo::None => blaze_link::Debug::None,
+        // A PE image has no line table: nothing writes the PDB one belongs in.
+        _ if triple(job, u).ends_with("windows-msvc") => blaze_link::Debug::None,
         _ => blaze_link::Debug::Lines,
     };
     let shared = match makes {
@@ -851,11 +853,13 @@ fn link_at(
             name: "blaze-seh-runtime".to_owned(),
             kind: blaze_link::NativeKind::Object,
         });
-        located.push(blaze_link::target::Located {
-            path: bcryptprimitives()?,
-            name: "bcryptprimitives.lib".to_owned(),
-            kind: blaze_link::NativeKind::Archive { whole: false },
-        });
+        if let Some(path) = raw_imports(job, unit, &generated.frontend, built)? {
+            located.push(blaze_link::target::Located {
+                name: "raw-dylib imports".to_owned(),
+                path,
+                kind: blaze_link::NativeKind::Shared { as_needed: true },
+            });
+        }
     }
     let side = generated.side()?;
 
@@ -883,18 +887,34 @@ fn seh_runtime() -> Result<std::path::PathBuf, LinkCause> {
     })
 }
 
-/// The import library of `bcryptprimitives.dll` (`lib /def`, of `ProcessPrng` alone), which
-/// std links as `raw-dylib`, as a file.
-fn bcryptprimitives() -> Result<std::path::PathBuf, LinkCause> {
-    let path = std::path::Path::new("blaze-bcryptprimitives.lib");
-    let bytes = include_bytes!("bcryptprimitives.lib");
-    let unreadable = |error: String| blaze_usercode::inputs::Unreadable { path: path.to_owned(), error };
-    let at = blaze_api::client::home().map_err(|error| LinkCause::Native(unreadable(error)))?.join(path);
-    if std::fs::metadata(&at).is_ok_and(|it| it.len() == bytes.len() as u64) {
-        return Ok(at);
+/// The import library of what the crates linked into `unit` import by `raw-dylib`, as a file
+/// named by its contents: natives are files, and two links of the same imports share one. No
+/// file when nothing does.
+fn raw_imports(
+    job: &Job,
+    unit: usize,
+    frontend: &HirFrontend<'_>,
+    built: &Built,
+) -> Result<Option<std::path::PathBuf>, LinkCause> {
+    let mut imports = frontend.marked_imports(built);
+    for at in job.graph.linked_in(unit as u32) {
+        if let Some(krate) = job.crates.krate(at as usize) {
+            imports.extend(frontend.raw_imports(krate));
+        }
     }
-    std::fs::write(&at, bytes).map_err(|error| LinkCause::Native(unreadable(error.to_string())))?;
-    Ok(at)
+    if imports.is_empty() {
+        return Ok(None);
+    }
+    imports.sort_unstable();
+    imports.dedup();
+    let bytes = blaze_link::target::import_library(&imports);
+    let path = std::path::PathBuf::from(format!("blaze-imports-{}.lib", ContentId::of("blaze v2 raw-dylib imports", &bytes)));
+    let unreadable = |error: String| blaze_usercode::inputs::Unreadable { path: path.clone(), error };
+    let at = blaze_api::client::home().map_err(|error| LinkCause::Native(unreadable(error)))?.join(&path);
+    if !at.exists() {
+        std::fs::write(&at, &bytes).map_err(|error| LinkCause::Native(unreadable(error.to_string())))?;
+    }
+    Ok(Some(at))
 }
 
 /// The image to link `output` into at `path`, taken out of `images`, and the fields of

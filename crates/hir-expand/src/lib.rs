@@ -816,15 +816,16 @@ impl MacroCallId {
                 unreachable!("`MacroCallId::macro_arg` called with `MacroCallKind::Derive`")
             }
             MacroCallKind::Attr { ast_id, censored_attr_ids: attr_ids, .. } => {
-                let (_, attr) = attr_ids.invoc_attr().find_attr_range_with_source_view(
-                    db,
-                    loc.krate,
-                    syntax::view::AnyHasAttrs::new(ast_id.to_view(db)),
-                );
-                let range = attr
-                    .path()
-                    .map(|path| path.syntax().text_range())
-                    .unwrap_or_else(|| attr.syntax().text_range());
+                let item = syntax::view::AnyHasAttrs::new(ast_id.to_view(db));
+                // None for a call its item's file no longer has: a macro's expansion changed
+                // under it, and this is a memo being checked on its way to being dropped.
+                let range = match attr_ids.invoc_attr().find_attr_range_with_source_opt_view(db, loc.krate, item) {
+                    Some((_, attr)) => attr
+                        .path()
+                        .map(|path| path.syntax().text_range())
+                        .unwrap_or_else(|| attr.syntax().text_range()),
+                    None => ast_id.to_view(db).syntax().text_range(),
+                };
                 let span = map.span_for_range(range);
 
                 let is_derive = matches!(loc.def.kind, MacroDefKind::BuiltInAttr(_, expander) if expander.is_derive());

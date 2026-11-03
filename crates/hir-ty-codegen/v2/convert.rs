@@ -462,6 +462,8 @@ fn reloc_target(
             Err(format!("a relocation in the unknown namespace {namespace}"))
         }
         RelocName::LibCall(libcall) => resolve.symbol(libcall_name(libcall)?),
+        // The word a Windows thread-local's code reads, which the linker makes.
+        RelocName::Known(cranelift_codegen::ir::KnownSymbol::CoffTlsIndex) => resolve.symbol("_tls_index"),
         RelocName::Known(symbol) => {
             // alloc: an error
             Err(format!("a relocation at the linker's {symbol:?}, which v2 has no target for"))

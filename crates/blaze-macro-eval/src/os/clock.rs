@@ -21,7 +21,7 @@ use crate::guest::Guest;
 const TAI_LEAD_S: u64 = 37;
 
 impl<'a> Os<'a> {
-    fn note_clock(&mut self) {
+    pub(super) fn note_clock(&mut self) {
         if !self.trace.clock {
             self.trace.clock = true;
             self.trace.note(Noted::Seen(Seen::Untraceable), untraceable_name(Untraceable::Clock));
@@ -90,6 +90,6 @@ pub(super) fn mach_timebase_info(g: &mut impl Guest, ret: &mut [u8], info: u64) 
 }
 
 /// Nanoseconds since the Unix epoch, now.
-fn now_ns() -> u64 {
+pub(super) fn now_ns() -> u64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |it| it.as_nanos() as u64)
 }

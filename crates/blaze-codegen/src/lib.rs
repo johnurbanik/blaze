@@ -403,6 +403,39 @@ pub struct NativeLib {
     pub verbatim: bool,
 }
 
+/// An item of a `#[link(kind = "raw-dylib")]` block: what no import library on the machine need
+/// hold, so the link makes one of them (`blaze_link::target::import_library`).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct RawImport {
+    /// The DLL's file name.
+    pub dll: String,
+    /// What the code calls it.
+    pub symbol: String,
+    /// What the DLL exports it as, when that is not `symbol`.
+    pub export: Option<String>,
+    /// A static, not a function.
+    pub data: bool,
+}
+
+impl RawImport {
+    const MARK: &str = "__blaze_raw$";
+
+    /// The symbol code calls `name` of `dll` by when no walk of its crate's modules finds the
+    /// block importing it, as one in a function's body: what it imports is in the symbol, so
+    /// the link reads it from the code, which a kept function is not compiled again to say.
+    pub fn marked(dll: &str, name: &str) -> String {
+        // alloc: per call of an import compiled
+        format!("{}{dll}${name}", RawImport::MARK)
+    }
+
+    /// What the symbol [`RawImport::marked`] made imports.
+    pub fn of_marked(symbol: &str) -> Option<RawImport> {
+        let (dll, name) = symbol.strip_prefix(RawImport::MARK)?.split_once('$')?;
+        // alloc: per import named in the code linked
+        Some(RawImport { dll: dll.to_owned(), symbol: symbol.to_owned(), export: Some(name.to_owned()), data: false })
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum NativeLibKind {
     /// `dylib`, and no `kind`: the linker takes whichever it finds, as rustc passes `-l`.

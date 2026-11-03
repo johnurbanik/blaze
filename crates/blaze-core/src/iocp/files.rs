@@ -4,18 +4,22 @@
 
 use std::{
     io::{self, Write as _},
-    os::windows::io::{AsRawHandle as _, OwnedHandle},
+    os::windows::{
+        fs::OpenOptionsExt as _,
+        io::{AsRawHandle as _, OwnedHandle},
+    },
     path::Path,
 };
 
 use windows_sys::Win32::{
     Foundation::{FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE},
     Storage::FileSystem::{
-        CREATE_NEW, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
-        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_END_OF_FILE_INFO,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_FLAG_SEQUENTIAL_SCAN, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FileEndOfFileInfo, GetFileAttributesW,
-        GetFileSizeEx, GetVolumeInformationByHandleW, INVALID_FILE_ATTRIBUTES,
+        CREATE_NEW, CreateFileW, DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_DISPOSITION_INFO, FILE_END_OF_FILE_INFO,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_FLAG_SEQUENTIAL_SCAN, FILE_GENERIC_WRITE,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FileDispositionInfo,
+        FileEndOfFileInfo, GetFileAttributesW, GetFileSizeEx, GetVolumeInformationByHandleW,
+        INVALID_FILE_ATTRIBUTES,
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS,
         OPEN_EXISTING, ReadFile, SetFileAttributesW, SetFileInformationByHandle, SetFileTime,
     },
@@ -127,11 +131,39 @@ fn moved(from: &Path, to: &Path) -> io::Result<()> {
     let (wide_from, wide_to) = (sys::path(from)?, sys::path(to)?);
     // SAFETY: two NUL-terminated paths. Write-through: it returns once the new name is on
     // the disk, which a directory's sync is on Unix.
-    sys::check(unsafe {
+    let moved = sys::check(unsafe {
         MoveFileExW(
             wide_from.as_ptr(),
             wide_to.as_ptr(),
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    });
+    match moved {
+        // A file with a handle open, as a `Mapped` keeps one: std's rename takes the POSIX way
+        // over it, as a rename goes on Unix, and the view keeps the old bytes.
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            std::fs::rename(from, to)?;
+            // `FlushFileBuffers` writes the log the rename is in, as the write-through would.
+            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(to) {
+                _ = file.sync_all();
+            }
+            Ok(())
+        }
+        moved => moved,
+    }
+}
+
+/// Whether `file`, opened with `DELETE`, goes with its last handle: a temporary file while it is
+/// written, so a process killed in a write of gigabytes leaves none of them behind.
+fn delete_on_close(file: &std::fs::File, delete: bool) -> io::Result<()> {
+    let info = FILE_DISPOSITION_INFO { DeleteFile: delete };
+    // SAFETY: an open handle, and a `FILE_DISPOSITION_INFO` of the size given, read by the call.
+    sys::check(unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfo,
+            (&raw const info).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
         )
     })
 }
@@ -142,10 +174,16 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     crate::fs::make_parent(path)?;
     let temporary = crate::fs::temporary_next_to(path);
     let written = (|| {
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .access_mode(FILE_GENERIC_WRITE | DELETE)
+            .open(&temporary)?;
+        delete_on_close(&file, true)?;
         file.write_all(bytes)?;
         // `FlushFileBuffers`.
-        file.sync_all()
+        file.sync_all()?;
+        delete_on_close(&file, false)
     })();
     let placed = written.and_then(|()| moved(&temporary, path));
     if placed.is_err() {

@@ -142,6 +142,13 @@ pub fn locate(
     Ok(located)
 }
 
+/// An import library of `imports`, the items of a program's `raw-dylib` blocks: a file of the
+/// link line as `NativeKind::Shared { as_needed: true }`, so a DLL none of them is used of is
+/// not one the image needs.
+pub fn import_library(imports: &[blaze_codegen::RawImport]) -> Vec<u8> {
+    crate::pe::import_library_of(imports)
+}
+
 /// The release channel in the sanitizer runtimes' names, as rustc's `CFG_RELEASE_CHANNEL`
 /// names them: blaze's toolchain is a nightly.
 const CHANNEL: &str = "nightly";

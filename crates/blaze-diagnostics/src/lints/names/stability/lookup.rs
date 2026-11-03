@@ -156,6 +156,16 @@ fn enabled_in(cx: &Cx<'_, '_>, enabled: &mut HashTable<(Symbol, bool), &Frame>, 
     it
 }
 
+/// Whether `range` of `file` is in the module blaze appends to a crate root, a test harness:
+/// what rustc's `--test` writes is an expansion allowed libtest.
+fn in_appended(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange) -> bool {
+    let db = cx.db;
+    let Some(file) = file.file_id() else { return false };
+    let file = file.file_id(db);
+    let Some(module) = db.file_text(file).appended_root_module(db) else { return false };
+    cx.file_text(file).find(module).is_some_and(|at| usize::from(range.start()) >= at)
+}
+
 /// `Span::allows_unstable(feature)` of `range` in `file`: the macro whose expansion its first
 /// token comes from is defined with `#[allow_internal_unstable(feature)]`. A builtin macro's
 /// expansion is its own, not the one rustc checks with the features its definition allows,
@@ -163,6 +173,9 @@ fn enabled_in(cx: &Cx<'_, '_>, enabled: &mut HashTable<(Symbol, bool), &Frame>, 
 fn allows_unstable(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange, feature: &Symbol) -> bool {
     use hir_expand::MacroDefKind;
     let db = cx.db;
+    if in_appended(cx, file, range) {
+        return true;
+    }
     let ctxt = file.span_map(db).span_for_range(range).ctx;
     let Some(call) = ctxt.outer_expn(db) else { return false };
     let def = hir_expand::MacroCallId::from(call).loc(db).def;

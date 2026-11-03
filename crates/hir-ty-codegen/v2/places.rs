@@ -112,7 +112,7 @@ fn bodyless(
 ) -> Result<String, String> {
     let name = FunctionSignature::of(db, func).name.as_str();
     match func.lookup(db).container {
-        ItemContainerId::ExternBlockId(_) => {
+        ItemContainerId::ExternBlockId(block) => {
             let Some(symbol) = link_name(db, func) else {
                 // alloc: the error's message
                 return Err(format!("`{name}` of an `extern` block has no link name"));
@@ -121,7 +121,7 @@ fn bodyless(
                 // alloc: the error's message
                 return Err(format!("a call of LLVM's intrinsic `{symbol}` the IR builder left"));
             }
-            Ok(symbol)
+            Ok(super::linked::extern_symbol(db, block, symbol))
         }
         ItemContainerId::TraitId(_) => match db.lookup_impl_method_or_why(env.as_ref(db), func, args) {
             Err(why) => Err(crate::no_impl_method(db, func, args, why)),

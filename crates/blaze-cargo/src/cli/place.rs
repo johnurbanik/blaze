@@ -185,6 +185,22 @@ pub fn host_path(text: &str) -> PathBuf {
     PathBuf::from(text)
 }
 
+/// A variable the daemon set, as a program started here reads it: a path the daemon named as
+/// this system opens it, anything else as it is.
+#[cfg(windows)]
+pub fn host_value(text: &str) -> String {
+    let bytes = text.as_bytes();
+    match bytes.len() >= 4 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' && bytes[3] == b'/' {
+        true => host_path(text).to_string_lossy().into_owned(),
+        false => text.to_owned(),
+    }
+}
+
+#[cfg(not(windows))]
+pub fn host_value(text: &str) -> String {
+    text.to_owned()
+}
+
 /// The command's environment, sorted by name. A variable that is not UTF-8 is refused by its
 /// name alone: its value is never shown.
 pub fn env(vars: impl Iterator<Item = (OsString, OsString)>) -> Result<Vec<(String, String)>, String> {

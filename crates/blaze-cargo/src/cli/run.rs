@@ -109,7 +109,10 @@ impl Exec {
 
     pub fn command(&self) -> std::process::Command {
         let mut command = std::process::Command::new(&self.program);
-        command.args(&self.args).envs(self.env.iter().map(|(name, value)| (name, value))).current_dir(&self.cwd);
+        command
+            .args(&self.args)
+            .envs(self.env.iter().map(|(name, value)| (name, super::place::host_value(value))))
+            .current_dir(super::place::host_path(&self.cwd.to_string_lossy()));
         command
     }
 }

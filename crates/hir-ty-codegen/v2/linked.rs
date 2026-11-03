@@ -8,15 +8,15 @@ mod tests;
 use super::{HashSource, Hashes, Kind, frontend::HirFrontend};
 use base_db::{Crate, Db};
 use blaze_codegen::{
-    CodegenError, Init, InstanceKey, NativeLib, NativeLibKind, Target, driver::Built,
+    CodegenError, Init, InstanceKey, NativeLib, NativeLibKind, RawImport, Target, driver::Built,
 };
 use blaze_format::cursor::Put;
 use blaze_hash::{HashMap, HashSet};
 use blaze_ids::ContentId;
 use blaze_items::{ItemId, ItemKey, key::Resolved};
 use hir_def::{
-    AttrDefId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, ItemContainerId, Lookup,
-    ModuleDefId,
+    AttrDefId, DefWithBodyId, ExpressionStoreOwnerId, ExternBlockId, FunctionId, ItemContainerId,
+    Lookup, ModuleDefId,
     attrs::{AttrFlags, NativeLibKind as Written},
     expr_store::Body as BodyStore,
     nameres::crate_def_map,
@@ -45,6 +45,17 @@ impl HirFrontend<'_> {
     /// crate leaves out. A form blaze can't link is an error naming it.
     pub fn linked(&self, krate: Crate) -> Result<Vec<NativeLib>, CodegenError> {
         self.with(|db, _| linked(db, krate)).map_err(error)
+    }
+
+    /// What `krate`'s `raw-dylib` blocks import, for the link to make an import library of.
+    pub fn raw_imports(&self, krate: Crate) -> Vec<RawImport> {
+        self.with(|db, _| raw_imports(db, krate))
+    }
+
+    /// What the code of `built` imports by [`RawImport::marked`] symbols, each as often as it
+    /// names it.
+    pub fn marked_imports(&self, built: &Built) -> Vec<RawImport> {
+        marked_imports(built)
     }
 
     /// The span tables `built`'s code names and its debug names.
@@ -84,14 +95,13 @@ fn linked(db: &Db, krate: Crate) -> Result<Vec<NativeLib>, String> {
                     Written::Unspecified | Written::Dylib => NativeLibKind::Dylib,
                     Written::Static => NativeLibKind::Static { whole: lib.whole_archive, bundle: lib.bundle },
                     Written::Framework => NativeLibKind::Framework,
-                    // std's `ProcessPrng`: the link of a Windows program adds an import library
-                    // of it, which the SDK has not.
-                    Written::RawDylib if name == "bcryptprimitives" => continue,
+                    // No file: the link makes an import library of [`raw_imports`].
+                    Written::RawDylib if crate::Target::current().triple().contains("windows") => continue,
                     Written::RawDylib => {
                         // alloc: an error
                         return Err(format!(
-                            "`#[link(name = \"{name}\", kind = \"raw-dylib\")]` in {}: blaze \
-                             links no `raw-dylib` (nor its `link_ordinal` and `import_name_type`)",
+                            "`#[link(name = \"{name}\", kind = \"raw-dylib\")]` in {}: only a Windows \
+                             program imports by `raw-dylib`",
                             named()
                         ));
                     }
@@ -164,6 +174,83 @@ fn linked(db: &Db, krate: Crate) -> Result<Vec<NativeLib>, String> {
         }
     }
     Ok(libs)
+}
+
+/// The file name of the DLL of a `raw-dylib` entry.
+fn dll_of(lib: &hir_def::attrs::NativeLib) -> String {
+    let name = lib.name.as_str();
+    // alloc: per block, its DLL's file name
+    if lib.verbatim { name.to_owned() } else { format!("{name}.dll") }
+}
+
+/// The symbol a function `symbol` of `block` is called by: for one of a `raw-dylib` block in a
+/// function's body, which no walk of its crate's modules finds, [`RawImport::marked`].
+pub(super) fn extern_symbol(db: &Db, block: ExternBlockId, symbol: String) -> String {
+    if !block.lookup(db).container.is_block_module(db) {
+        return symbol;
+    }
+    match AttrFlags::native_libs(db, block).iter().find(|it| matches!(it.kind, Written::RawDylib)) {
+        Some(lib) => RawImport::marked(&dll_of(lib), &symbol),
+        None => symbol,
+    }
+}
+
+/// See [`HirFrontend::marked_imports`].
+fn marked_imports(built: &Built) -> Vec<RawImport> {
+    fn of(targets: &[Target]) -> impl Iterator<Item = RawImport> + '_ {
+        targets.iter().filter_map(|it| match it {
+            Target::Extern(name) => RawImport::of_marked(name),
+            _ => None,
+        })
+    }
+    // alloc: per link, its imports
+    let mut imports = Vec::new();
+    for function in &built.functions {
+        imports.extend(of(function.relocs.targets()));
+        imports.extend(function.data.iter().flat_map(|it| of(it.relocs.targets())));
+    }
+    for static_ in &built.statics {
+        if let Init::Bytes { relocs, .. } = &static_.init {
+            imports.extend(of(relocs.targets()));
+        }
+        imports.extend(static_.data.iter().flat_map(|it| of(it.relocs.targets())));
+    }
+    imports
+}
+
+/// What the `raw-dylib` blocks among `krate`'s modules import.
+fn raw_imports(db: &Db, krate: Crate) -> Vec<RawImport> {
+    // alloc: per crate linked, its imports
+    let mut imports = Vec::new();
+    // alloc: per crate linked, each block's DLL, with room kept from one module to the next
+    let mut dlls: HashMap<ExternBlockId, String> = HashMap::default();
+    for (_, module) in crate_def_map(db, krate).modules(db) {
+        let scope = module.scope(db);
+        dlls.clear();
+        for block in scope.extern_blocks() {
+            for lib in AttrFlags::native_libs(db, block).iter() {
+                if matches!(lib.kind, Written::RawDylib) {
+                    dlls.insert(block, dll_of(lib));
+                }
+            }
+        }
+        if dlls.is_empty() {
+            continue;
+        }
+        for def in scope.declarations() {
+            let (container, symbol, data) = match def {
+                ModuleDefId::FunctionId(it) => (it.lookup(db).container, crate::link_name(db, it), false),
+                ModuleDefId::StaticId(it) => (it.lookup(db).container, crate::static_link_name(db, it), true),
+                _ => continue,
+            };
+            let ItemContainerId::ExternBlockId(block) = container else { continue };
+            if let (Some(dll), Some(symbol)) = (dlls.get(&block), symbol) {
+                // clone: per import, its library's name
+                imports.push(RawImport { dll: dll.clone(), symbol, export: None, data });
+            }
+        }
+    }
+    imports
 }
 
 /// Every span table `built` names, encoded: of each body and function declaration of its
@@ -281,12 +368,14 @@ fn named_anchors(built: &Built) -> HashMap<ContentId, NamedBy> {
             _ => None,
         })
     }
+    // A PE image has no line table: nothing writes the PDB one belongs in.
+    let lines_read = crate::Target::current().object_format != crate::ObjectFormat::Coff;
     let mut named: HashMap<ContentId, NamedBy> = HashMap::default();
     for function in &built.functions {
         let by = |what: &'static str| move |anchor: ContentId| (anchor, NamedBy::Function { key: function.key, what });
         let code = named_in(function.relocs.targets()).map(by("a position in"));
         let data = function.data.iter().flat_map(|it| named_in(it.relocs.targets())).map(by("the data of"));
-        let lines = function.lines.iter().map(|it| it.span.anchor).map(by("a line row of"));
+        let lines = function.lines.iter().filter(|_| lines_read).map(|it| it.span.anchor).map(by("a line row of"));
         for (anchor, by) in code.chain(data).chain(lines) {
             named.entry(anchor).or_insert(by);
         }

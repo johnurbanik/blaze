@@ -5,8 +5,12 @@
 //! A descriptor holds what it names whole, read at its open: a file's bytes, so a `read` is a
 //! copy from them, or a directory's sorted names, listed at its first `readdir`. Its slot is
 //! kept when it is closed, buffers and all, for the next open.
+//!
+//! Paths are the daemon's (on Windows the drive is the first part: `C:\a` is `/C:/a`), so a walk
+//! is the same on every system; [`host`] makes one this system's to open.
 
 use std::{
+    borrow::Cow,
     fs,
     hash::Hasher as _,
     io::{self, Read as _},
@@ -21,7 +25,7 @@ use super::{
 use crate::guest::{Guest, Stop, put_word};
 
 /// The first descriptor a macro is given: 0, 1 and 2 are the evaluator's.
-const FIRST_FD: i64 = 3;
+pub(super) const FIRST_FD: i64 = 3;
 
 /// How many links a walk follows before it is a loop, as Linux's `MAXSYMLINKS`.
 const MAX_LINKS: u32 = 40;
@@ -47,8 +51,13 @@ pub(super) struct Roots {
 }
 
 impl Roots {
-    fn cwd(&self) -> Option<&str> {
+    pub(super) fn cwd(&self) -> Option<&str> {
         self.dirs[0].as_deref()
+    }
+
+    /// Whether `path` is `OUT_DIR` or below it.
+    pub(super) fn in_out_dir(&self, path: &str) -> bool {
+        self.dirs[1].as_deref().is_some_and(|dir| under(path, dir))
     }
 
     /// The root `path` is below or is, when it is in one.
@@ -57,13 +66,44 @@ impl Roots {
     }
 }
 
+/// The path the daemon names `path`, as this system opens it.
+#[cfg(windows)]
+pub(super) fn host(path: &str) -> &str {
+    let bytes = path.as_bytes();
+    match bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+        true => &path[1..],
+        false => path,
+    }
+}
+
+#[cfg(not(windows))]
+pub(super) fn host(path: &str) -> &str {
+    path
+}
+
+/// A path as the daemon names it: [`host`]'s inverse. A relative one stays relative.
+#[cfg(windows)]
+pub(super) fn daemon_path(path: &str) -> Cow<'_, str> {
+    let path = path.strip_prefix(r"\\?\").unwrap_or(path).replace('\\', "/");
+    let bytes = path.as_bytes();
+    Cow::Owned(match bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        true => format!("/{}{}", char::from(bytes[0].to_ascii_uppercase()), &path[1..]),
+        false => path,
+    })
+}
+
+#[cfg(not(windows))]
+pub(super) fn daemon_path(path: &str) -> Cow<'_, str> {
+    Cow::Borrowed(path)
+}
+
 /// Whether `path` is `dir` or below it.
 fn under(path: &str, dir: &str) -> bool {
     dir == "/" || (path.starts_with(dir) && matches!(path.as_bytes().get(dir.len()), None | Some(b'/')))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-enum Open {
+pub(super) enum Open {
     #[default]
     Closed,
     File,
@@ -73,25 +113,29 @@ enum Open {
 /// One descriptor's slot.
 #[derive(Default)]
 pub(super) struct Slot {
-    open: Open,
+    pub(super) open: Open,
     /// The real path of what it names.
-    path: String,
-    ino: u64,
+    pub(super) path: String,
+    pub(super) ino: u64,
+    /// A file's size, whether or not it was read.
+    pub(super) size: u64,
     /// A file's bytes, and where the next `read` starts.
-    bytes: Vec<u8>,
-    at: u64,
+    pub(super) bytes: Vec<u8>,
+    pub(super) at: u64,
     /// A directory's names, end to end, and each entry, sorted; listed once.
-    names: Vec<u8>,
-    entries: Vec<Entry>,
-    listed: bool,
+    pub(super) names: Vec<u8>,
+    pub(super) entries: Vec<Entry>,
+    pub(super) listed: bool,
+    /// A file being made: `bytes` are what was written, put on disk at its close.
+    pub(super) writing: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Entry {
-    start: u32,
-    end: u32,
-    kind: Kind,
-    ino: u64,
+pub(super) struct Entry {
+    pub(super) start: u32,
+    pub(super) end: u32,
+    pub(super) kind: Kind,
+    pub(super) ino: u64,
 }
 
 /// A directory stream: the `DIR *` the program holds is the address of its `struct dirent`,
@@ -172,7 +216,7 @@ pub(super) fn walk(
         let parent = out.len();
         out.push('/');
         out.push_str(&rest[part]);
-        let meta = match fs::symlink_metadata(&*out) {
+        let meta = match fs::symlink_metadata(host(out)) {
             Ok(meta) => meta,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 // The whole path that is missing, so that it is the one keyed and checked
@@ -193,13 +237,14 @@ pub(super) fn walk(
             if links > MAX_LINKS {
                 return Err(Fail::Errno(Errno::Loop));
             }
-            let target = fs::read_link(&*out).map_err(Fail::Io)?;
+            let target = fs::read_link(host(out)).map_err(Fail::Io)?;
             let Some(target) = target.to_str() else { return Err(Fail::NotUtf8) };
+            let target = daemon_path(target);
             out.truncate(parent);
             if target.starts_with('/') {
                 out.clear();
             }
-            rest.replace_range(..at, target);
+            rest.replace_range(..at, &target);
             at = 0;
             continue;
         }
@@ -238,7 +283,7 @@ pub(super) fn ino_of(path: &[u8]) -> u64 {
 impl<'a> Os<'a> {
     /// The roots, found and noted on the first path: which directories may be read depends on
     /// the two variables, so an expansion that reads a path is keyed by them.
-    fn ready(&mut self) {
+    pub(super) fn ready(&mut self) {
         if self.roots.is_some() {
             return;
         }
@@ -266,7 +311,7 @@ impl<'a> Os<'a> {
         if !path.starts_with('/') {
             if at == t.at_flags().fdcwd {
                 self.ready();
-                let Some(cwd) = self.roots.as_ref().and_then(Roots::cwd) else {
+                let Some(cwd) = self.cwd.as_deref().or(self.roots.as_ref().and_then(Roots::cwd)) else {
                     // alloc: error path
                     return Err(Stop(format!(
                         "names the relative path `{path}`, and the calling crate has no \
@@ -295,7 +340,7 @@ impl<'a> Os<'a> {
     /// What `path` from the directory `at` names, walked to [`Os::real`] and noted as `seen`:
     /// the real path, and the path as given when it differs (a link or a `..` on the way,
     /// which a change can make lead elsewhere). A path outside the roots is refused.
-    fn locate(
+    pub(super) fn locate(
         &mut self,
         t: Target,
         (at, path): (i64, &str),
@@ -336,9 +381,9 @@ impl<'a> Os<'a> {
             self.trace.note(Noted::RefusedRead, &self.real);
             return Ok(Err(Errno::Acces));
         }
-        self.trace.note(Noted::Seen(seen), &self.real);
+        self.trace.note(Noted::Seen(seen), host(&self.real));
         if self.given != self.real {
-            self.trace.note(Noted::Seen(seen), &self.given);
+            self.trace.note(Noted::Seen(seen), host(&self.given));
         }
         Ok(match found {
             Found::Is(kind, size) => Ok((kind, size)),
@@ -387,7 +432,7 @@ impl<'a> Os<'a> {
             return Err(Stop(format!("opens `{path}` to write, which a proc macro may not")));
         }
         let follow = flags & open.nofollow == 0;
-        let (kind, _) = match self.locate(t, (at, path), follow, Seen::Read)? {
+        let (kind, size) = match self.locate(t, (at, path), follow, Seen::Read)? {
             Ok(found) => found,
             Err(errno) => return fail(t, g, ret, errno),
         };
@@ -396,29 +441,38 @@ impl<'a> Os<'a> {
             Kind::Link => fail(t, g, ret, Errno::Loop),
             // alloc: error path
             Kind::Other => Err(Stop(format!("opens `{}`, which is neither a file nor a directory", self.real))),
-            Kind::File | Kind::Dir => {
-                let fd = self.free_slot();
-                let slot = &mut self.fds[fd];
-                slot.path.clear();
-                slot.path.push_str(&self.real);
-                slot.ino = ino_of(self.real.as_bytes());
-                slot.at = 0;
-                slot.bytes.clear();
-                slot.listed = false;
-                if kind == Kind::File {
-                    let read = fs::File::open(&self.real).and_then(|mut file| file.read_to_end(&mut slot.bytes));
-                    if let Err(error) = read {
-                        let path = std::mem::take(&mut self.real);
-                        self.cant(&path, &error);
-                        self.real = path;
-                        return fail(t, g, ret, Errno::Io);
-                    }
-                }
-                let slot = &mut self.fds[fd];
-                slot.open = if kind == Kind::File { Open::File } else { Open::Dir };
-                ok(ret, (fd as i64 + FIRST_FD) as u64)
+            Kind::File | Kind::Dir => match self.opened(kind, size, kind == Kind::File) {
+                Ok(fd) => ok(ret, fd as u64),
+                Err(errno) => fail(t, g, ret, errno),
+            },
+        }
+    }
+
+    /// A descriptor of what [`Os::locate`] left in [`Os::real`], a file or a directory of
+    /// `size`: a file read whole when `read`, else only looked at. `Err` if it can't be read.
+    pub(super) fn opened(&mut self, kind: Kind, size: u64, read: bool) -> Result<i64, Errno> {
+        let fd = self.free_slot();
+        let slot = &mut self.fds[fd];
+        slot.path.clear();
+        slot.path.push_str(&self.real);
+        slot.ino = ino_of(self.real.as_bytes());
+        slot.size = size;
+        slot.at = 0;
+        slot.bytes.clear();
+        slot.listed = false;
+        slot.writing = false;
+        if read {
+            let bytes = fs::File::open(host(&self.real)).and_then(|mut file| file.read_to_end(&mut slot.bytes));
+            if let Err(error) = bytes {
+                let path = std::mem::take(&mut self.real);
+                self.cant(&path, &error);
+                self.real = path;
+                return Err(Errno::Io);
             }
         }
+        let slot = &mut self.fds[fd];
+        slot.open = if kind == Kind::File { Open::File } else { Open::Dir };
+        Ok(fd as i64 + FIRST_FD)
     }
 
     pub(super) fn read(
@@ -744,7 +798,7 @@ impl<'a> Os<'a> {
 
     /// Lists the directory of the slot `index`, sorted, with `.` and `..` first as a
     /// `readdir` gives them, and notes it listed.
-    fn list(&mut self, index: usize) -> io::Result<()> {
+    pub(super) fn list(&mut self, index: usize) -> io::Result<()> {
         let slot = &mut self.fds[index];
         slot.names.clear();
         slot.entries.clear();
@@ -766,7 +820,7 @@ impl<'a> Os<'a> {
             path.push(b'/');
         }
         let dir = path.len();
-        for entry in fs::read_dir(&slot.path)? {
+        for entry in fs::read_dir(host(&slot.path))? {
             let entry = entry?;
             let kind = entry.file_type()?;
             let kind = if kind.is_dir() {
@@ -792,7 +846,7 @@ impl<'a> Os<'a> {
             names[a.start as usize..a.end as usize].cmp(&names[b.start as usize..b.end as usize])
         });
         slot.listed = true;
-        self.trace.note(Noted::Seen(Seen::Listed), &slot.path);
+        self.trace.note(Noted::Seen(Seen::Listed), host(&slot.path));
         Ok(())
     }
 
@@ -834,15 +888,15 @@ impl<'a> Os<'a> {
     }
 }
 
-fn slot_index(fds: &[Slot], fd: i64) -> Option<usize> {
+pub(super) fn slot_index(fds: &[Slot], fd: i64) -> Option<usize> {
     let at = usize::try_from(fd.checked_sub(FIRST_FD)?).ok()?;
     (fds.get(at)?.open != Open::Closed).then_some(at)
 }
 
-fn slot(fds: &[Slot], fd: i64) -> Option<&Slot> {
+pub(super) fn slot(fds: &[Slot], fd: i64) -> Option<&Slot> {
     slot_index(fds, fd).map(|at| &fds[at])
 }
 
-fn slot_mut(fds: &mut [Slot], fd: i64) -> Option<&mut Slot> {
+pub(super) fn slot_mut(fds: &mut [Slot], fd: i64) -> Option<&mut Slot> {
     slot_index(fds, fd).map(|at| &mut fds[at])
 }

@@ -347,12 +347,14 @@ fn sort_unique_from(out: &mut Vec<ContentId>, start: usize) {
 
 /// What a function's code names beyond its `Bound`, as [`placed`] takes it: into `anchors`
 /// (cleared) every span anchor, sorted and each once, of the positions its code and its data
-/// name, of its debug lines (a backtrace shows them) and those the statics it names name,
-/// transitively; into `statics` (cleared) the bound of each static it names, in the order of
-/// the statics, each once. `Err` is why a static it names has no bound.
+/// name, of its debug lines the link took a table of (a backtrace shows them, and a target
+/// with no line table takes none) and those the statics it names name, transitively; into
+/// `statics` (cleared) the bound of each static it names, in the order of the statics, each
+/// once. `Err` is why a static it names has no bound.
 fn named_by(
     function: &CompiledFunction,
     bounds: &StaticBounds,
+    spans: &SpanIds,
     anchors: &mut Vec<ContentId>,
     statics: &mut Vec<(ItemKey, ContentId, ContentId)>,
 ) -> Result<(), String> {
@@ -374,7 +376,7 @@ fn named_by(
             _ => {}
         }
     }
-    anchors.extend(function.lines.iter().map(|it| it.span.anchor));
+    anchors.extend(function.lines.iter().map(|it| it.span.anchor).filter(|it| spans.get(it).is_some()));
     sort_unique_from(anchors, 0);
     statics.sort_unstable();
     statics.dedup();
@@ -579,7 +581,7 @@ impl ExecTable {
             let Ok(code) = built.functions.binary_search_by_key(runs, |it| it.key) else {
                 return Err(ExecError::NotCompiled { function });
             };
-            named_by(&built.functions[code], &statics, anchors, named)
+            named_by(&built.functions[code], &statics, &spans, anchors, named)
                 .map_err(|why| ExecError::Unbound { function, why })?;
             placed(bound, named, anchors, &spans).map_err(|anchor| ExecError::NoSpans { function, anchor })
         });

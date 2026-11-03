@@ -115,7 +115,9 @@ impl MapOptions {
     }
 
     /// The whole of `file`, mapped read-only and shared with every other mapping of it; an
-    /// empty file maps nothing. The handle may close after: the mapping keeps the file.
+    /// empty file maps nothing. The handle may close after: the mapping keeps the file. On
+    /// Windows that takes a handle of its own: with none open, renaming another file over this
+    /// one frees its clusters under the view, and every page not yet read reads as zeros.
     ///
     /// # Safety
     ///
@@ -133,7 +135,14 @@ impl MapOptions {
         }
         // SAFETY: the caller's contract above; `len` is not 0.
         let (at, len) = unsafe { sys::map(file, len, self) }?;
-        Ok(Mapped { at, len })
+        #[cfg(windows)]
+        let kept = file.try_clone()?;
+        Ok(Mapped {
+            at,
+            len,
+            #[cfg(windows)]
+            _file: Some(kept),
+        })
     }
 }
 
@@ -142,6 +151,9 @@ impl MapOptions {
 pub struct Mapped {
     at: NonNull<u8>,
     len: usize,
+    /// What keeps the file's clusters for as long as the view is read ([`MapOptions::map`]).
+    #[cfg(windows)]
+    _file: Option<File>,
 }
 
 // SAFETY: read-only pages that no one writes while they are mapped (`MapOptions::map`'s
@@ -152,7 +164,12 @@ unsafe impl Sync for Mapped {}
 
 impl Mapped {
     /// No bytes, and nothing to unmap: what an empty file maps.
-    pub const EMPTY: Mapped = Mapped { at: NonNull::dangling(), len: 0 };
+    pub const EMPTY: Mapped = Mapped {
+        at: NonNull::dangling(),
+        len: 0,
+        #[cfg(windows)]
+        _file: None,
+    };
 
     /// The file at `path` mapped whole, with [`MapOptions::new`].
     ///

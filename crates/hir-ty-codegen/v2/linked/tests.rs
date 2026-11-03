@@ -69,6 +69,10 @@ fn a_link_blaze_cannot_make_is_an_error_naming_it() {
         ("extern \"C\" {\n    #[link_ordinal(1)]\n    fn ordinal();\n}", "`#[link_ordinal(..)]` on `ordinal`"),
         ("extern \"C\" {\n    #[link_ordinal(2)]\n    static ORDINAL: u8;\n}", "`#[link_ordinal(..)]` on `ORDINAL`"),
     ] {
+        // A Windows link makes the library of one.
+        if cfg!(windows) && named == "raw-dylib" {
+            continue;
+        }
         let (db, frontend) = frontend(text);
         let error = frontend.linked(fixture::test_crate(&db)).unwrap_err();
         assert!(error.what.contains(named), "{text}: {}", error.what);

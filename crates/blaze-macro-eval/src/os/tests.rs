@@ -7,6 +7,7 @@ use super::{
     Answer, Call, Os, Shim,
     files::{MANIFEST_DIR, OUT_DIR},
     target::{Errno, Field, Kind, STAT_MAX, Stat, System, Target},
+    win32::Win32,
 };
 use crate::guest::{Guest, Stop, tests::Buffer};
 
@@ -618,4 +619,62 @@ fn assert_errnos(t: Target) {
     for (errno, code) in pairs {
         assert_eq!(t.errno(errno), code, "{errno:?}");
     }
+}
+
+/// A Win32 call over `g`: what it returned.
+fn win32(os: &mut Os<'_>, g: &mut Buffer, call: Win32, args: &[&[u8]]) -> u64 {
+    let mut out = [0u8; 8];
+    os.call(Shim { call: Call::Win32(call), target: None }, g, args, &mut out).unwrap();
+    u64::from_le_bytes(out)
+}
+
+/// `text` with its NUL, as a Win32 call reads a string.
+fn utf16(text: &str) -> Vec<u8> {
+    text.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect()
+}
+
+const OUT: u64 = 0x1000 + 128;
+
+/// A buffer holding `text` at its start, with a place at [`OUT`] for what a call gives back.
+fn holding(text: &str) -> Buffer {
+    let mut bytes = utf16(text);
+    bytes.resize(1024, 0);
+    Buffer { base: 0x1000, bytes, errno: None }
+}
+
+#[test]
+fn a_variable_is_given_as_win32_gives_it_and_a_missing_one_says_so() {
+    let mut env = Env::default();
+    env.set("FOO", "bar");
+    env.set(OUT_DIR, "/C:/target/out");
+    let mut os = Os::new(&env);
+    let start = 0x1000u64.to_le_bytes();
+    let into = OUT.to_le_bytes();
+    let get = Win32::GetEnvironmentVariable;
+
+    let mut g = holding("foo");
+    assert_eq!(win32(&mut os, &mut g, get, &[&start, &into, &[64, 0, 0, 0]]), 3, "of any case");
+    assert_eq!(g.read(OUT, 8).unwrap(), &utf16("bar")[..]);
+    assert_eq!(win32(&mut os, &mut g, get, &[&start, &into, &[3, 0, 0, 0]]), 4, "the units it needs");
+
+    let mut g = holding(OUT_DIR);
+    assert_eq!(win32(&mut os, &mut g, get, &[&start, &into, &[64, 0, 0, 0]]), 13);
+    assert_eq!(g.read(OUT, 28).unwrap(), &utf16(r"C:\target\out")[..]);
+
+    let mut g = holding("NOT_SET");
+    assert_eq!(win32(&mut os, &mut g, Win32::SetLastError, &[&[0, 0, 0, 0]]), 0);
+    assert_eq!(win32(&mut os, &mut g, get, &[&start, &into, &[64, 0, 0, 0]]), 0);
+    assert_eq!(win32(&mut os, &mut g, Win32::GetLastError, &[]), 203);
+}
+
+#[test]
+fn a_full_path_is_made_from_its_text() {
+    let env = Env::default();
+    let mut os = Os::new(&env);
+    let start = 0x1000u64.to_le_bytes();
+    let into = OUT.to_le_bytes();
+    let mut g = holding(r"C:\a\.\b\..\c");
+    let full = win32(&mut os, &mut g, Win32::GetFullPathName, &[&start, &[64, 0, 0, 0], &into, &[0; 8]]);
+    assert_eq!(full, 6);
+    assert_eq!(g.read(OUT, 14).unwrap(), &utf16(r"C:\a\c")[..]);
 }

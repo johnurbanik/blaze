@@ -22,7 +22,7 @@ use std::{
 use base_db::{ConstEvalBudget, Crate, CrateOrigin, Db, Env};
 use blaze_hash::HashMap;
 use blaze_profile::span::{Ending, MacroExpand, MacroExpanded, Name as SpanName, Outcome};
-use hir_def::{AssocItemId, FunctionId, HasModule, ModuleDefId, StaticId, nameres::crate_def_map};
+use hir_def::{AssocItemId, FunctionId, HasModule, ModuleDefId, StaticId, nameres::crate_def_map, signatures::StaticSignature};
 use hir_expand::name::Name;
 use hir_ty::{
     InferBodyId, ParamEnvAndCrate,
@@ -53,9 +53,10 @@ pub(crate) const MEMORY: u64 = 1 << 30;
 /// The steps (basic blocks run) one expansion may take on the evaluator before it stops,
 /// naming the macro and where it was: a macro that loops ends in an error, not a stalled
 /// build. Each expansion of a run, the session's earlier calls run again included, has its own.
-/// A derive of serde's size runs a few million basic blocks natively: this is ten to a hundred
-/// times that, and minutes of the evaluator at most.
-pub(crate) const STEPS: u64 = 1 << 27;
+/// A derive of serde's size runs a few million basic blocks natively: this is a thousand times
+/// that, for `tauri::generate_context!` to read a megabyte of JSON, and minutes of the evaluator
+/// at most.
+pub(crate) const STEPS: u64 = 1 << 31;
 
 /// The `usize` of the evaluated client: the shims model only 64-bit targets (`os/target.rs`),
 /// and [`State::word`] is the same eight bytes.
@@ -382,6 +383,23 @@ pub(crate) fn of_sysroot(db: &Db, st: StaticId) -> bool {
     matches!(st.module(db).krate(db).data(db).origin, CrateOrigin::Lang(_))
 }
 
+/// Whether `st` is proc-macro2's memo of whether it runs inside a macro (`WORKS`, and the `Once`
+/// that fills it, in its `detection.rs`): each run's first question sets them to the same bytes,
+/// from `proc_macro::is_available`, and they answer nothing else. As state they would make every
+/// crate built on proc-macro2 stateful: its calls a session, in order, again in each revision,
+/// none of them kept.
+///
+/// tauri-macros' `RUSTC_VERSION` is such a memo too: the version it asked once for each call.
+fn is_memo(db: &Db, st: StaticId) -> bool {
+    let krate = st.module(db).krate(db);
+    let extra = krate.extra_data(db);
+    let Some(name) = extra.display_name.as_ref() else { return false };
+    matches!(
+        (name.crate_name().symbol().as_str(), StaticSignature::of(db, st).name.as_str()),
+        ("proc_macro2", "WORKS" | "INIT") | ("tauri_macros", "RUSTC_VERSION")
+    )
+}
+
 /// Runs `expansions` in order on one evaluator, each with its own server as rustc gives each
 /// expansion its own handles, starting from the statics `preset`: what the last gave, and
 /// what all of them did. The ones before the last are the session's earlier calls, run again
@@ -569,7 +587,7 @@ fn expand_all<'db>(
     // alloc: once per run, the statics it changed
     let mut statics = Vec::new();
     eval.changed_statics(&mut statics)?;
-    statics.retain(|(st, _, _)| !of_sysroot(db, *st));
+    statics.retain(|(st, _, _)| !of_sysroot(db, *st) && !is_memo(db, *st));
     Ok((output, statics))
 }
 

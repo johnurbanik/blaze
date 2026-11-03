@@ -23,6 +23,7 @@ mod env;
 mod files;
 mod random;
 pub(crate) mod target;
+mod win32;
 
 #[cfg(test)]
 mod tests;
@@ -36,7 +37,10 @@ use hir_def::{
 
 use crate::guest::{Guest, Stop, put_word, word};
 
-use self::target::{Errno, Sys, Target};
+use self::{
+    target::{Errno, Sys, Target},
+    win32::Win32,
+};
 
 /// What a claimed function is: which shim, decided once per function.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -104,6 +108,8 @@ enum Call {
     Syscall,
     /// A Win32 call of std that has nothing to do here, one run on one thread: its result.
     Returns(u64),
+    /// A Win32 call of std that is answered.
+    Win32(Win32),
 }
 
 impl Call {
@@ -152,9 +158,9 @@ impl Call {
             "syscall" => Call::Syscall,
             // std's thread-locals on Windows: their destructors are never run in a macro.
             "FlsAlloc" | "FlsSetValue" | "FlsFree" | "TlsAlloc" | "TlsSetValue" | "TlsFree" => Call::Returns(1),
-            "GetLastError" | "SetLastError" | "FlsGetValue" | "TlsGetValue" => Call::Returns(0),
+            "FlsGetValue" | "TlsGetValue" => Call::Returns(0),
             "GetCurrentThreadId" | "GetProcessHeap" => Call::Returns(1),
-            _ => return None,
+            _ => Call::Win32(Win32::of_name(name)?),
         })
     }
 
@@ -243,6 +249,11 @@ pub(crate) struct Os<'a> {
     scratch: Vec<u8>,
     /// The bytes of a C string built to give the program.
     bytes: Vec<u8>,
+    /// The thread's last error, which a failed Win32 call says why through.
+    last_error: u32,
+    /// Where `SetCurrentDirectoryW` left it, this expansion's alone: the compiler's own never
+    /// moves.
+    cwd: Option<String>,
 }
 
 impl<'a> Os<'a> {
@@ -264,6 +275,8 @@ impl<'a> Os<'a> {
             rest: String::new(), // alloc: as `given`
             scratch: Vec::new(), // alloc: none until the first listing, then reused
             bytes: Vec::new(), // alloc: none until the first string given, then reused
+            last_error: 0,
+            cwd: None,
         }
     }
 
@@ -314,6 +327,9 @@ impl<'a> Os<'a> {
             put_word(ret, value);
             return Ok(Answer::Answered);
         }
+        if let Call::Win32(call) = shim.call {
+            return self.win32(call, guest, args, ret);
+        }
         // Fixed keys: nothing of the system.
         if shim.call == Call::HashmapRandomKeys {
             return Ok(random::hashmap_random_keys(ret));
@@ -328,7 +344,7 @@ impl<'a> Os<'a> {
         };
         let g = guest;
         match shim.call {
-            Call::Returns(_) => unreachable!("answered above"),
+            Call::Returns(_) | Call::Win32(_) => unreachable!("answered above"),
             Call::Open => {
                 let flags = int(args, 1)?;
                 self.open(t, g, ret, (t.at_flags().fdcwd, word(args, 0)?, flags))

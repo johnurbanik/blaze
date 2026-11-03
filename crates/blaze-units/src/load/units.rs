@@ -699,7 +699,12 @@ fn std_key(
 fn harness_of(unit: &Unit, packages: &BySpec<'_>) -> bool {
     let Some((_, package)) = packages.get(unit.pkg_id.as_str()) else { return false };
     package.manifest.targets.iter().any(|target| {
-        target.name == unit.target.name && target.harness && kind_name(&target.kind) == unit.target.kind.first().map(String::as_str)
+        let same_kind = match kind_name(&target.kind) {
+            // A library's kinds are its crate types.
+            None => unit.target.is_lib(),
+            kind => kind == unit.target.kind.first().map(String::as_str),
+        };
+        target.name == unit.target.name && target.harness && same_kind
     })
 }
 

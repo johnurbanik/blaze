@@ -1132,7 +1132,8 @@ fn relative_file(
 ) -> Result<EditionedFileId, ExpandError> {
     let lookup = call_id.loc(db);
     let call_site = lookup.kind.file_id().original_file_respecting_includes(db).file_id(db);
-    let path = AnchoredPath { anchor: call_site, path: path_str };
+    let named = daemon_path(path_str);
+    let path = AnchoredPath { anchor: call_site, path: &named };
     let res: FileId = db.resolve_path(path).ok_or_else(|| {
         db.include_source(path, lookup.krate);
         ExpandError::other(err_span, format!("failed to load file `{path_str}`")) // alloc: an error's message, on the error path
@@ -1143,6 +1144,37 @@ fn relative_file(
     } else {
         Ok(EditionedFileId::new(db, res, lookup.krate.data(db).edition))
     }
+}
+
+/// A path as the database names it: on Windows the drive is the first part, so `C:\a` is
+/// `/C:/a`, which a path made from [`host_value`] comes back to.
+#[cfg(windows)]
+fn daemon_path(path: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = path.as_bytes();
+    match bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/') {
+        true => format!("/{}{}", char::from(bytes[0].to_ascii_uppercase()), &path[1..].replace('\\', "/")).into(), // alloc: per include of an absolute path
+        false => path.into(),
+    }
+}
+
+#[cfg(not(windows))]
+fn daemon_path(path: &str) -> std::borrow::Cow<'_, str> {
+    path.into()
+}
+
+/// A variable as the crate reads it: a path the database names, as this system opens it.
+#[cfg(windows)]
+fn host_value(value: String) -> String {
+    let bytes = value.as_bytes();
+    match bytes.len() >= 4 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' && bytes[3] == b'/' {
+        true => value[1..].replace('/', "\\"),
+        false => value,
+    }
+}
+
+#[cfg(not(windows))]
+fn host_value(value: String) -> String {
+    value
 }
 
 /// The path `include!`, `include_str!` or `include_bytes!` (`name`) is given and its span, as
@@ -1325,10 +1357,11 @@ fn get_env_inner(db: &Db, arg_id: MacroCallId, key: &Symbol) -> Option<String> {
     // The standard library's crates read their own alone, as a std built elsewhere does: no
     // workspace's environment is in their identity.
     let own = krate.env(db).get(key.as_str());
-    match krate.data(db).origin.is_lang() {
+    let value = match krate.data(db).origin.is_lang() {
         true => own,
         false => own.or_else(|| base_db::process_env_var(db, key.as_str())),
-    }
+    };
+    value.map(host_value)
 }
 
 fn env_expand<'f>(

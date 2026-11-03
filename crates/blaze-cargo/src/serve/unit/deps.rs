@@ -11,9 +11,10 @@
 //! - Its images are written once the head's next build lowers into the front end kept
 //!   ([`store`]): every unit of the build it was kept from has compiled, so what each crate
 //!   resolves to is memoized already.
-//! - `BLAZE_DEP_IMAGES=check` resolves every crate served as well, and `verify` writes again
-//!   what was read; either fails the build, once it has ended, on any difference from the
-//!   images ([`differences`]): the daily differential run.
+//! - Images are read only when `BLAZE_DEP_IMAGES` asks ([`mode_in`]): `serve` reads them,
+//!   `check` resolves every crate served as well, and `verify` writes again what was read;
+//!   either of those fails the build, once it has ended, on any difference from the images
+//!   ([`differences`]): the daily differential run.
 //! - The same store, through one adapter per database ([`Session`]), keeps what else is
 //!   computed once for everyone: the dependencies' check outcomes and checked bodies
 //!   ([`blaze_diagnostics::cache`]), their constants' values (`hir_ty::consteval::deps`) and
@@ -86,9 +87,13 @@ pub(crate) fn serve(
     session: &mut Session,
     kept: &mut Option<Kept>,
 ) -> Result<(), ApiError> {
-    let mode = mode_in(&job.input.config.invocation.env)?;
+    let wanted = mode_in(&job.input.config.invocation.env)?;
+    let mode = wanted.unwrap_or(Mode::Serve);
     let build = build()?;
-    let served = lowered.serve_deps(units, build, &*session.images, mode).map_err(super::lower_error)?;
+    let served = match wanted {
+        Some(mode) => lowered.serve_deps(units, build, &*session.images, mode).map_err(super::lower_error)?,
+        None => Served::default(),
+    };
     debug_assert!(session.images.take_puts().is_empty(), "serving puts nothing");
     match kept {
         Some(kept) => kept.add(served),
@@ -211,18 +216,21 @@ impl Session {
     }
 }
 
-/// What the job's `BLAZE_DEP_IMAGES` asks done with an image: unset serves it, `check`
-/// resolves its crate as well, `verify` writes again what was read; any other value is an
-/// error naming it.
-fn mode_in(env: &[(String, String)]) -> Result<Mode, ApiError> {
+/// What the job's `BLAZE_DEP_IMAGES` asks done with an image: unset reads none, since an image
+/// holds no impl tables of its crate and the impls maintainer is told nothing of a crate served
+/// (`hir_ty::method_resolution::delta`), which it then fails on; `serve` serves it, `check`
+/// resolves its crate as well, `verify` writes again what was read; any other value is an error
+/// naming it.
+fn mode_in(env: &[(String, String)]) -> Result<Option<Mode>, ApiError> {
     match env.iter().find(|(name, _)| name == IMAGES).map(|(_, value)| value.as_str()) {
-        None => Ok(Mode::Serve),
-        Some("check") => Ok(Mode::Check),
-        Some("verify") => Ok(Mode::Verify),
+        None => Ok(None),
+        Some("serve") => Ok(Some(Mode::Serve)),
+        Some("check") => Ok(Some(Mode::Check)),
+        Some("verify") => Ok(Some(Mode::Verify)),
         Some(value) => Err(ApiError::new(
             format!(
-                "{IMAGES}={value} is not a value blaze takes: `check` resolves each dependency read from its \
-                 image as well, `verify` writes again what was read, unset reads it"
+                "{IMAGES}={value} is not a value blaze takes: `serve` reads each dependency from its image, \
+                 `check` resolves it as well, `verify` writes again what was read, unset reads none"
             ),
             None,
         )),

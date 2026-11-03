@@ -16,10 +16,11 @@
 //! calls are run again on the same evaluator before the next one.
 //!
 //! Whether a crate's macros keep state is learned, as the wasm host learns it, and kept in the
-//! store by the crate's code: unseen, its calls expand in a session (`requires_session`), in
-//! declaration order, and no kept expansion is used, since a hit skips a run that may have left
-//! state; once a build ran some and none left state ([`flush`]), it is stateless and its calls
-//! are found in the store; once one left state, it is stateful for good.
+//! store by the crate's code. Unseen, its calls expand as a stateless crate's, on every core and
+//! kept: thousands of derives in a first build are an hour in one session, and hardly any crate
+//! has state. The first run that leaves state shows the guess wrong, which every run checks: it
+//! fails that build ([`Library::saw`]) and the crate is stateful for good, its calls a session
+//! (`requires_session`) in declaration order, none of them found in the store.
 
 use std::{
     fmt,
@@ -127,6 +128,41 @@ fn tell(library: &Library, verdict: &'static [u8]) {
     });
 }
 
+/// How many expansions run on the evaluator at once. Each holds gigabytes while it runs, so one
+/// on every core committed 170 GiB on a 64 GiB machine.
+const RUNNING: usize = 4;
+
+/// How long a run waits for a place. Past this it runs anyway: a run in a place may be waiting
+/// for something this thread holds, and a build over the memory it wanted is better than a stall.
+const RUNNING_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+static RUNS: Mutex<usize> = Mutex::new(0);
+static RUN_ENDED: parking_lot::Condvar = parking_lot::Condvar::new();
+
+/// A place among the [`RUNNING`] runs, given back when dropped.
+struct Running;
+
+impl Running {
+    fn enter() -> Running {
+        let mut runs = RUNS.lock();
+        let until = std::time::Instant::now() + RUNNING_WAIT;
+        while *runs >= RUNNING {
+            if RUN_ENDED.wait_until(&mut runs, until).timed_out() {
+                break;
+            }
+        }
+        *runs += 1;
+        Running
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        *RUNS.lock() -= 1;
+        RUN_ENDED.notify_one();
+    }
+}
+
 /// Every library loaded, for [`flush`].
 static LIBRARIES: Mutex<Vec<Weak<Library>>> = Mutex::new(Vec::new()); // alloc: none: an empty `Vec` in a const
 
@@ -158,9 +194,9 @@ impl Library {
         if contradicted {
             // alloc: error path
             return Err(ProcMacroExpansionError::System(format!(
-                "the proc macros of `{}` keep state between expansions, which the store said they \
-                 did not: this build's expansions of them may not be what rustc gives; they expand \
-                 in a session from the next load",
+                "the proc macros of `{}` keep state between expansions, which they were taken not \
+                 to: this build's expansions of them may not be what rustc gives; they expand in a \
+                 session from the next load, so build again",
                 self.name
             )));
         }
@@ -250,6 +286,10 @@ pub fn load(db: &Db, krate: Crate, toolchain: ContentId) -> ProcMacroLoadResult 
     let verdict = verdict(&loaded)
         // alloc: error path
         .map_err(|why| refused(format!("the proc-macro crate `{name}`: its verdict in the store: {why}")))?;
+    let verdict = match verdict {
+        Verdict::Unseen if !cfg!(test) => Verdict::Stateless,
+        known => known,
+    };
     let library = Arc::new(Library { // alloc: once a proc-macro crate loaded
         krate,
         name,
@@ -491,7 +531,10 @@ impl Evaluated {
                 Err(FindError::Inputs(unreadable)) => return Err(system(format_args!("{}: {unreadable}", self.what()))),
             }
         }
-        let ran = self.run(db, calling, &call)?;
+        let ran = {
+            let _running = Running::enter();
+            self.run(db, calling, &call)?
+        };
         let output = self.output(&ran, call.call_site)?;
         let bytes = written(&output, &spans);
         if let Some((kept, reads)) = found {
